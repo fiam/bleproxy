@@ -1,0 +1,43 @@
+# cargo-deny supply-chain policy. Run with `cargo deny check` or
+# `cargo xtask deny`. Reference: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Evaluate the dependency graph for every platform we ship, not just the
+# machine running the check.
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+
+[advisories]
+# RustSec advisories (vulnerabilities, unsoundness, unmaintained crates).
+# Any match fails the check; an exception must go in `ignore` with a reason.
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Everything must be compatible with distributing bleproxy under
+# MIT OR Apache-2.0. Extend this list deliberately, never with copyleft.
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+confidence-threshold = 0.93
+# Fail when an allowed license is no longer used, keeping the list minimal.
+unused-allowed-license = "deny"
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+deny = [
+    # TLS, when needed, should come from rustls rather than system OpenSSL,
+    # which complicates static and cross builds.
+    { crate = "openssl-sys", reason = "use rustls instead" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
