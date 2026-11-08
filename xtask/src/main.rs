@@ -446,6 +446,17 @@ mod tests {
     }
 
     #[test]
+    fn release_image_uses_pinned_toolchain() {
+        let path = workspace_root().join("Dockerfile");
+        let dockerfile = std::fs::read_to_string(path).unwrap();
+        let expected = format!("ARG RUST_VERSION={}", toolchain_channel().unwrap());
+        assert!(
+            dockerfile.lines().any(|line| line == expected),
+            "Dockerfile must declare `{expected}`"
+        );
+    }
+
+    #[test]
     fn reads_pinned_toolchain() {
         let channel = toolchain_channel().unwrap();
         assert!(

@@ -1,0 +1,7 @@
+# Keep the build context to what `cargo build` needs.
+/target
+/.git
+/.github
+/docker
+/lcov.info
+**/*.profraw
