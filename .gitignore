@@ -1,0 +1,4 @@
+/target
+# Coverage output (cargo xtask coverage)
+/lcov.info
+*.profraw

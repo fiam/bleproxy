@@ -1,0 +1,18 @@
+[package]
+name = "bleproxy-core"
+description = "Platform-independent Bluetooth Low Energy types and proxy state for bleproxy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+categories = ["no-std", "embedded", "hardware-support"]
+keywords = ["bluetooth", "ble", "esphome", "home-assistant"]
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

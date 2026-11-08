@@ -1,0 +1,7 @@
+# Tests may use unwrap/expect/panic for brevity; production code may not.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+
+# Product names that are not code identifiers. ".." keeps clippy's defaults.
+doc-valid-idents = ["ESPHome", ".."]
