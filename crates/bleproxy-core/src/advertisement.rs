@@ -6,7 +6,7 @@ use crate::BdAddr;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum AdvertisementError {
-    /// The payload is longer than a legacy advertising PDU allows.
+    /// The payload is longer than [`AdvData::MAX_LEN`].
     #[error("advertising data is {len} bytes, at most {max} are allowed", max = AdvData::MAX_LEN)]
     DataTooLong {
         /// Length of the rejected payload.
@@ -48,7 +48,10 @@ impl TryFrom<u8> for AddressType {
     }
 }
 
-/// Payload of a single legacy advertising or scan response PDU.
+/// Raw advertising data: a sequence of AD structures.
+///
+/// Holds the payload of a legacy advertising PDU followed by the payload of
+/// its scan response, which is how the ESPHome Native API forwards them.
 ///
 /// Stored inline with a fixed capacity so advertisements can be passed
 /// around without heap allocation, which matters on the scanning hot path
@@ -62,8 +65,9 @@ pub struct AdvData {
 }
 
 impl AdvData {
-    /// Maximum payload length of a legacy advertising PDU.
-    pub const MAX_LEN: usize = 31;
+    /// Maximum length: two legacy PDU payloads (advertising and scan
+    /// response) of 31 bytes each.
+    pub const MAX_LEN: usize = 62;
 
     /// Copies `data` into a new payload.
     ///
