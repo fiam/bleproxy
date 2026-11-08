@@ -5,7 +5,12 @@ members = ["apps/*", "crates/*", "xtask"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+# Minimum supported Rust version, verified by `cargo xtask msrv`. Day-to-day
+# development uses the newer toolchain pinned in rust-toolchain.toml. The
+# floor is set by the ESP32 dependencies (esp-hal, esp-rtos), and staying
+# below the latest stable lets the esp-rs Xtensa toolchain, which lags
+# upstream Rust, build the firmware.
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fiam/bleproxy"
 homepage = "https://github.com/fiam/bleproxy"

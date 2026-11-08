@@ -25,6 +25,7 @@ enum Task {
     Deny,
     Deps,
     Coverage,
+    Msrv,
     Ci,
     Docker(Platform),
     Help,
@@ -48,6 +49,10 @@ const TASKS: &[(&str, &str)] = &[
     (
         "coverage",
         "Write an lcov coverage report to lcov.info (cargo-llvm-cov)",
+    ),
+    (
+        "msrv",
+        "Check the host workspace with the minimum supported Rust",
     ),
     ("ci", "Run every check CI runs on the host"),
     (
@@ -134,6 +139,7 @@ fn parse(name: &str, args: &[String]) -> Result<Task> {
         "deny" => Task::Deny,
         "deps" => Task::Deps,
         "coverage" => Task::Coverage,
+        "msrv" => Task::Msrv,
         "ci" => Task::Ci,
         "docker" => return parse_docker(args),
         "help" | "-h" | "--help" => Task::Help,
@@ -183,6 +189,7 @@ fn run(task: Task) -> Result {
             cargo(["machete"])
         }
         Task::Coverage => coverage(),
+        Task::Msrv => msrv(),
         Task::Ci => ci(),
         Task::Docker(platform) => docker(platform),
         Task::Help => {
@@ -204,6 +211,7 @@ fn ci() -> Result {
         Task::FmtCheck,
         Task::Metadata,
         Task::Lint,
+        Task::Msrv,
         Task::Build,
         Task::Test,
         Task::Docs,
@@ -301,15 +309,40 @@ fn docker(platform: Platform) -> Result {
     )
 }
 
+/// Checks the host workspace with the `rust-version` declared in
+/// `Cargo.toml`, installing that toolchain if needed.
+fn msrv() -> Result {
+    let version = rust_version()?;
+    status(
+        toolchain_cargo(&version)
+            .args(["check", "--locked", "--all-targets"])
+            // Keep the regular target directory's cache intact.
+            .args(["--target-dir", "target/msrv"]),
+    )
+}
+
 /// Returns the Rust version pinned in `rust-toolchain.toml`.
 fn toolchain_channel() -> Result<String> {
-    let path = workspace_root().join("rust-toolchain.toml");
+    toml_string("rust-toolchain.toml", "channel")
+}
+
+/// Returns the minimum supported Rust version declared in `Cargo.toml`.
+fn rust_version() -> Result<String> {
+    toml_string("Cargo.toml", "rust-version")
+}
+
+/// Returns the first `key = "value"` string in a workspace file.
+///
+/// Good enough for the flat, well-known files it reads, without pulling a
+/// TOML parser into the task runner.
+fn toml_string(file: &str, key: &str) -> Result<String> {
+    let path = workspace_root().join(file);
     let text = std::fs::read_to_string(&path)?;
     text.lines()
         .filter_map(|line| line.split_once('='))
-        .find(|(key, _)| key.trim() == "channel")
+        .find(|(name, _)| name.trim() == key)
         .map(|(_, value)| value.trim().trim_matches('"').to_owned())
-        .ok_or_else(|| format!("no toolchain channel in {}", path.display()).into())
+        .ok_or_else(|| format!("no `{key}` in {}", path.display()).into())
 }
 
 /// Runs cargo with `args` from the workspace root.
@@ -321,9 +354,21 @@ where
     status(cargo_command().args(args))
 }
 
+/// Returns a cargo command for the workspace's pinned toolchain.
 fn cargo_command() -> Command {
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut command = Command::new(cargo);
+    command(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+}
+
+/// Returns a cargo command for `toolchain`, installing it if needed.
+fn toolchain_cargo(toolchain: &str) -> Command {
+    let mut command = command("rustup");
+    command.args(["run", "--install", toolchain, "cargo"]);
+    command
+}
+
+/// Returns a command for `program` that runs from the workspace root.
+fn command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
     command.current_dir(workspace_root());
     // `cargo run` describes the xtask package itself through these
     // variables. Child commands must not inherit them: some plugins, such as
@@ -456,12 +501,20 @@ mod tests {
         );
     }
 
+    fn assert_version(version: &str) {
+        assert!(
+            version.split('.').all(|part| part.parse::<u32>().is_ok()),
+            "{version}"
+        );
+    }
+
     #[test]
     fn reads_pinned_toolchain() {
-        let channel = toolchain_channel().unwrap();
-        assert!(
-            channel.split('.').all(|part| part.parse::<u32>().is_ok()),
-            "{channel}"
-        );
+        assert_version(&toolchain_channel().unwrap());
+    }
+
+    #[test]
+    fn reads_rust_version() {
+        assert_version(&rust_version().unwrap());
     }
 }
