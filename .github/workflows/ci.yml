@@ -136,6 +136,9 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install
       - uses: esp-rs/xtensa-toolchain@ec6d36527049a7f4fb2cb0c1a644668c1bb8a2a4 # v1.7.0
+        env:
+          # espup queries the GitHub API, which rate-limits anonymous calls.
+          GITHUB_TOKEN: ${{ github.token }}
         with:
           buildtargets: esp32s3
           version: 1.97.0.0
