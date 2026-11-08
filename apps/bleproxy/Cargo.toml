@@ -1,0 +1,18 @@
+[package]
+name = "bleproxy"
+description = "Bluetooth LE proxy for Home Assistant, speaking the ESPHome Native API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+categories = ["command-line-utilities", "hardware-support"]
+keywords = ["bluetooth", "ble", "esphome", "home-assistant", "proxy"]
+
+[dependencies]
+clap.workspace = true
+
+[lints]
+workspace = true

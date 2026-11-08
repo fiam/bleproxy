@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["apps/*", "crates/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,6 +15,7 @@ authors = ["The bleproxy contributors"]
 bleproxy-core = { path = "crates/bleproxy-core", version = "0.1.0" }
 bleproxy-protocol = { path = "crates/bleproxy-protocol", version = "0.1.0" }
 
+clap = { version = "4.6.7", features = ["derive"] }
 # `default-features = false` keeps it usable from `no_std` crates.
 thiserror = { version = "2.0.21", default-features = false }
 
