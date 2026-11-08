@@ -20,8 +20,10 @@ homepage = "https://github.com/fiam/bleproxy"
 authors = ["The bleproxy contributors"]
 
 [workspace.dependencies]
-bleproxy-core = { path = "crates/bleproxy-core", version = "0.1.0" }
-bleproxy-protocol = { path = "crates/bleproxy-protocol", version = "0.1.0" }
+# Internal crates are referenced by path only, so release version bumps
+# (release-please) never have to keep requirements in sync.
+bleproxy-core = { path = "crates/bleproxy-core" }
+bleproxy-protocol = { path = "crates/bleproxy-protocol" }
 
 clap = { version = "4.6.7", features = ["derive"] }
 # `default-features = false` keeps it usable from `no_std` crates.

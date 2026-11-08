@@ -465,7 +465,7 @@ fn rust_version() -> Result<String> {
 ///
 /// Good enough for the flat, well-known files it reads, without pulling a
 /// TOML parser into the task runner.
-fn toml_string(file: &str, key: &str) -> Result<String> {
+fn toml_string(file: impl AsRef<Path>, key: &str) -> Result<String> {
     let path = workspace_root().join(file);
     let text = std::fs::read_to_string(&path)?;
     text.lines()
@@ -646,6 +646,24 @@ mod tests {
             version.split('.').all(|part| part.parse::<u32>().is_ok()),
             "{version}"
         );
+    }
+
+    #[test]
+    fn release_please_bumps_every_package_in_the_lockfile() {
+        // release-please's TOML updater cannot match names by prefix, so
+        // release-please-config.json lists each workspace package.
+        let config =
+            std::fs::read_to_string(workspace_root().join("release-please-config.json")).unwrap();
+        for dir in ["apps", "crates"] {
+            for entry in std::fs::read_dir(workspace_root().join(dir)).unwrap() {
+                let manifest = entry.unwrap().path().join("Cargo.toml");
+                let name = toml_string(&manifest, "name").unwrap();
+                assert!(
+                    config.contains(&format!("@.name.value == '{name}'")),
+                    "release-please-config.json does not bump `{name}` in Cargo.lock"
+                );
+            }
+        }
     }
 
     #[test]
