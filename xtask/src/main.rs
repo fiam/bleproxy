@@ -26,52 +26,83 @@ enum Task {
     Deps,
     Coverage,
     Ci,
+    Docker(Platform),
     Help,
 }
 
-/// Every task with its name and description, in the order `help` lists them.
-const TASKS: &[(Task, &str, &str)] = &[
-    (Task::Build, "build", "Build the host workspace"),
-    (Task::Check, "check", "Type-check the host workspace"),
-    (Task::Fmt, "fmt", "Format all code"),
-    (Task::FmtCheck, "fmt-check", "Verify formatting"),
-    (Task::Lint, "lint", "Run Clippy, denying warnings"),
+/// Usage and description of every task, in the order `help` lists them.
+const TASKS: &[(&str, &str)] = &[
+    ("build", "Build the host workspace"),
+    ("check", "Type-check the host workspace"),
+    ("fmt", "Format all code"),
+    ("fmt-check", "Verify formatting"),
+    ("lint", "Run Clippy, denying warnings"),
+    ("test", "Run tests (nextest if installed, plus doctests)"),
+    ("docs", "Build documentation, denying warnings"),
+    ("metadata", "Validate the workspace manifests and lockfile"),
     (
-        Task::Test,
-        "test",
-        "Run tests (nextest if installed, plus doctests)",
-    ),
-    (Task::Docs, "docs", "Build documentation, denying warnings"),
-    (
-        Task::Metadata,
-        "metadata",
-        "Validate the workspace manifests and lockfile",
-    ),
-    (
-        Task::Deny,
         "deny",
         "Check advisories, licenses, bans and sources (cargo-deny)",
     ),
+    ("deps", "Find unused dependencies (cargo-machete)"),
     (
-        Task::Deps,
-        "deps",
-        "Find unused dependencies (cargo-machete)",
-    ),
-    (
-        Task::Coverage,
         "coverage",
         "Write an lcov coverage report to lcov.info (cargo-llvm-cov)",
     ),
-    (Task::Ci, "ci", "Run every check CI runs on the host"),
-    (Task::Help, "help", "Show this message"),
+    ("ci", "Run every check CI runs on the host"),
+    (
+        "docker <platform>",
+        "Run the tests in a container: linux-amd64, linux-arm64 or windows",
+    ),
+    ("help", "Show this message"),
 ];
 
-impl Task {
+/// A platform whose test suite runs in a Docker container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Platform {
+    LinuxAmd64,
+    LinuxArm64,
+    /// `x86_64-pc-windows-gnu`, built with MinGW and run under Wine.
+    Windows,
+}
+
+impl Platform {
+    const ALL: [Self; 3] = [Self::LinuxAmd64, Self::LinuxArm64, Self::Windows];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::LinuxAmd64 => "linux-amd64",
+            Self::LinuxArm64 => "linux-arm64",
+            Self::Windows => "windows",
+        }
+    }
+
     fn from_name(name: &str) -> Option<Self> {
-        TASKS
-            .iter()
-            .find(|(_, task_name, _)| *task_name == name)
-            .map(|(task, _, _)| *task)
+        Self::ALL
+            .into_iter()
+            .find(|platform| platform.name() == name)
+    }
+
+    /// Container platform. Non-native ones run under QEMU emulation.
+    const fn docker_platform(self) -> &'static str {
+        match self {
+            Self::LinuxAmd64 | Self::Windows => "linux/amd64",
+            Self::LinuxArm64 => "linux/arm64",
+        }
+    }
+
+    const fn dockerfile(self) -> &'static str {
+        match self {
+            Self::LinuxAmd64 | Self::LinuxArm64 => "docker/linux-test.Dockerfile",
+            Self::Windows => "docker/windows-test.Dockerfile",
+        }
+    }
+
+    const fn test_args(self) -> &'static [&'static str] {
+        match self {
+            Self::LinuxAmd64 | Self::LinuxArm64 => &["test", "--locked"],
+            Self::Windows => &["test", "--locked", "--target", "x86_64-pc-windows-gnu"],
+        }
     }
 }
 
@@ -92,14 +123,38 @@ fn main() -> ExitCode {
 
 fn parse(name: &str, args: &[String]) -> Result<Task> {
     let task = match name {
-        "-h" | "--help" => Task::Help,
-        name => Task::from_name(name)
-            .ok_or_else(|| format!("unknown task `{name}`, see `cargo xtask help`"))?,
+        "build" => Task::Build,
+        "check" => Task::Check,
+        "fmt" => Task::Fmt,
+        "fmt-check" => Task::FmtCheck,
+        "lint" => Task::Lint,
+        "test" => Task::Test,
+        "docs" => Task::Docs,
+        "metadata" => Task::Metadata,
+        "deny" => Task::Deny,
+        "deps" => Task::Deps,
+        "coverage" => Task::Coverage,
+        "ci" => Task::Ci,
+        "docker" => return parse_docker(args),
+        "help" | "-h" | "--help" => Task::Help,
+        _ => return Err(format!("unknown task `{name}`, see `cargo xtask help`").into()),
     };
     if !args.is_empty() {
         return Err(format!("`{name}` takes no arguments, got {args:?}").into());
     }
     Ok(task)
+}
+
+fn parse_docker(args: &[String]) -> Result<Task> {
+    let names = Platform::ALL.map(Platform::name).join(", ");
+    match args {
+        [platform] => Platform::from_name(platform)
+            .map(Task::Docker)
+            .ok_or_else(|| {
+                format!("unknown platform `{platform}`, expected one of: {names}").into()
+            }),
+        _ => Err(format!("`docker` takes one platform: {names}").into()),
+    }
 }
 
 fn run(task: Task) -> Result {
@@ -129,6 +184,7 @@ fn run(task: Task) -> Result {
         }
         Task::Coverage => coverage(),
         Task::Ci => ci(),
+        Task::Docker(platform) => docker(platform),
         Task::Help => {
             help();
             Ok(())
@@ -138,8 +194,8 @@ fn run(task: Task) -> Result {
 
 fn help() {
     println!("Usage: cargo xtask <task>\n\nTasks:");
-    for (_, name, about) in TASKS {
-        println!("  {name:<10}  {about}");
+    for (usage, about) in TASKS {
+        println!("  {usage:<17}  {about}");
     }
 }
 
@@ -211,6 +267,49 @@ fn coverage() -> Result {
     )?;
     eprintln!("wrote lcov.info");
     Ok(())
+}
+
+/// Builds the test image for `platform` and runs the test suite in it.
+///
+/// The source tree is mounted read-only; build output and the crate
+/// registry live in named volumes so repeated runs are incremental.
+fn docker(platform: Platform) -> Result {
+    let root = workspace_root().canonicalize()?;
+    let name = platform.name();
+    let image = format!("bleproxy-test-{name}");
+    let rust_version = toolchain_channel()?;
+    status(
+        Command::new("docker")
+            .current_dir(&root)
+            .args(["build", "--platform", platform.docker_platform()])
+            .args(["--build-arg", &format!("RUST_VERSION={rust_version}")])
+            .args(["--tag", &image, "--file", platform.dockerfile(), "docker"]),
+    )?;
+    status(
+        Command::new("docker")
+            .args(["run", "--rm", "--platform", platform.docker_platform()])
+            .args(["--volume", &format!("{}:/src:ro", root.display())])
+            .args(["--workdir", "/src"])
+            .args(["--volume", &format!("bleproxy-target-{name}:/target")])
+            .args(["--env", "CARGO_TARGET_DIR=/target"])
+            .args([
+                "--volume",
+                "bleproxy-cargo-registry:/usr/local/cargo/registry",
+            ])
+            .args([&image, "cargo"])
+            .args(platform.test_args()),
+    )
+}
+
+/// Returns the Rust version pinned in `rust-toolchain.toml`.
+fn toolchain_channel() -> Result<String> {
+    let path = workspace_root().join("rust-toolchain.toml");
+    let text = std::fs::read_to_string(&path)?;
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .find(|(key, _)| key.trim() == "channel")
+        .map(|(_, value)| value.trim().trim_matches('"').to_owned())
+        .ok_or_else(|| format!("no toolchain channel in {}", path.display()).into())
 }
 
 /// Runs cargo with `args` from the workspace root.
@@ -312,9 +411,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_task_has_a_unique_name() {
-        for (task, name, _) in TASKS {
-            assert_eq!(parse(name, &[]).unwrap(), *task, "{name}");
+    fn every_listed_task_parses() {
+        for (usage, _) in TASKS {
+            let mut words = usage.split_whitespace();
+            let name = words.next().unwrap();
+            if words.next() == Some("<platform>") {
+                for platform in Platform::ALL {
+                    let task = parse(name, &[platform.name().into()]).unwrap();
+                    assert_eq!(task, Task::Docker(platform));
+                }
+            } else {
+                parse(name, &[]).unwrap();
+            }
         }
     }
 
@@ -328,5 +436,21 @@ mod tests {
     fn rejects_unexpected_arguments() {
         let err = parse("build", &["--release".into()]).unwrap_err();
         assert!(err.to_string().contains("takes no arguments"));
+    }
+
+    #[test]
+    fn docker_requires_a_known_platform() {
+        assert!(parse("docker", &[]).is_err());
+        assert!(parse("docker", &["solaris".into()]).is_err());
+        assert!(parse("docker", &["windows".into(), "extra".into()]).is_err());
+    }
+
+    #[test]
+    fn reads_pinned_toolchain() {
+        let channel = toolchain_channel().unwrap();
+        assert!(
+            channel.split('.').all(|part| part.parse::<u32>().is_ok()),
+            "{channel}"
+        );
     }
 }
