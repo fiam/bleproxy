@@ -1,0 +1,46 @@
+[package]
+name = "bleproxy-esp32"
+description = "bleproxy firmware for ESP32-C3 and ESP32-S3 microcontrollers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "bleproxy-esp32"
+# There is no host test harness on bare-metal targets.
+test = false
+bench = false
+
+[dependencies]
+embassy-executor = "0.10.0"
+esp-backtrace = { version = "0.20.0", features = ["panic-handler", "println"] }
+esp-bootloader-esp-idf = "0.6.0"
+esp-hal = "1.2.2"
+esp-println = "0.18.0"
+esp-rtos = { version = "0.4.0", features = ["embassy"] }
+
+# Exactly one chip feature must be enabled; `cargo xtask esp32 <chip>` picks
+# it together with the matching target.
+[features]
+esp32c3 = [
+    "esp-backtrace/esp32c3",
+    "esp-bootloader-esp-idf/esp32c3",
+    "esp-hal/esp32c3",
+    "esp-println/esp32c3",
+    "esp-rtos/esp32c3",
+]
+esp32s3 = [
+    "esp-backtrace/esp32s3",
+    "esp-bootloader-esp-idf/esp32s3",
+    "esp-hal/esp32s3",
+    "esp-println/esp32s3",
+    "esp-rtos/esp32s3",
+]
+
+[lints]
+workspace = true

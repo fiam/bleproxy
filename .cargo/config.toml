@@ -1,3 +1,18 @@
 [alias]
 # Development tasks: `cargo xtask help` lists them.
 xtask = "run --quiet --package xtask --"
+
+# Firmware targets, used by `cargo xtask esp32`. `cargo run` flashes the
+# board and opens a serial monitor through espflash.
+[target.riscv32imc-unknown-none-elf]
+runner = "espflash flash --monitor --chip esp32c3"
+# Frame pointers let esp-backtrace print backtraces on RISC-V.
+rustflags = ["-C", "force-frame-pointers"]
+
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor --chip esp32s3"
+rustflags = [
+    "-C", "link-arg=-nostartfiles",
+    # The chip's IRAM is both writable and executable by design.
+    "-C", "link-arg=-Wl,--no-warn-rwx-segments",
+]

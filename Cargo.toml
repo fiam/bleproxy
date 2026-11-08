@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["apps/*", "crates/*", "xtask"]
+# Everything except the firmware, which needs a bare-metal target and a chip
+# feature (see `cargo xtask esp32`). Plain cargo commands stay host-only.
+default-members = ["apps/bleproxy", "crates/*", "xtask"]
 
 [workspace.package]
 version = "0.1.0"

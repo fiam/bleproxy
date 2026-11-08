@@ -28,6 +28,7 @@ enum Task {
     Msrv,
     Ci,
     Docker(Platform),
+    Esp32(Chip),
     Help,
 }
 
@@ -58,6 +59,10 @@ const TASKS: &[(&str, &str)] = &[
     (
         "docker <platform>",
         "Run the tests in a container: linux-amd64, linux-arm64 or windows",
+    ),
+    (
+        "esp32 [chip]",
+        "Lint and build the firmware: esp32c3 (default) or esp32s3",
     ),
     ("help", "Show this message"),
 ];
@@ -111,6 +116,42 @@ impl Platform {
     }
 }
 
+/// A microcontroller the firmware can be built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chip {
+    Esp32c3,
+    Esp32s3,
+}
+
+impl Chip {
+    const ALL: [Self; 2] = [Self::Esp32c3, Self::Esp32s3];
+
+    /// Name of the chip, which is also the firmware's feature name.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Esp32c3 => "esp32c3",
+            Self::Esp32s3 => "esp32s3",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|chip| chip.name() == name)
+    }
+
+    const fn target(self) -> &'static str {
+        match self {
+            Self::Esp32c3 => "riscv32imc-unknown-none-elf",
+            Self::Esp32s3 => "xtensa-esp32s3-none-elf",
+        }
+    }
+
+    /// Whether the chip needs esp-rs's Xtensa toolchain instead of the
+    /// pinned upstream one.
+    const fn is_xtensa(self) -> bool {
+        matches!(self, Self::Esp32s3)
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let result = match args.split_first() {
@@ -142,6 +183,7 @@ fn parse(name: &str, args: &[String]) -> Result<Task> {
         "msrv" => Task::Msrv,
         "ci" => Task::Ci,
         "docker" => return parse_docker(args),
+        "esp32" => return parse_esp32(args),
         "help" | "-h" | "--help" => Task::Help,
         _ => return Err(format!("unknown task `{name}`, see `cargo xtask help`").into()),
     };
@@ -160,6 +202,17 @@ fn parse_docker(args: &[String]) -> Result<Task> {
                 format!("unknown platform `{platform}`, expected one of: {names}").into()
             }),
         _ => Err(format!("`docker` takes one platform: {names}").into()),
+    }
+}
+
+fn parse_esp32(args: &[String]) -> Result<Task> {
+    let names = Chip::ALL.map(Chip::name).join(", ");
+    match args {
+        [] => Ok(Task::Esp32(Chip::Esp32c3)),
+        [chip] => Chip::from_name(chip)
+            .map(Task::Esp32)
+            .ok_or_else(|| format!("unknown chip `{chip}`, expected one of: {names}").into()),
+        _ => Err(format!("`esp32` takes at most one chip: {names}").into()),
     }
 }
 
@@ -192,6 +245,7 @@ fn run(task: Task) -> Result {
         Task::Msrv => msrv(),
         Task::Ci => ci(),
         Task::Docker(platform) => docker(platform),
+        Task::Esp32(chip) => esp32(chip),
         Task::Help => {
             help();
             Ok(())
@@ -307,6 +361,79 @@ fn docker(platform: Platform) -> Result {
             .args([&image, "cargo"])
             .args(platform.test_args()),
     )
+}
+
+/// Lints and builds the firmware for `chip` in release mode.
+fn esp32(chip: Chip) -> Result {
+    let cargo = || {
+        if chip.is_xtensa() {
+            let mut command = command("rustup");
+            command.args(["run", XTENSA_TOOLCHAIN, "cargo"]);
+            command
+        } else {
+            cargo_command()
+        }
+    };
+    if chip.is_xtensa() {
+        require_xtensa_toolchain(chip)?;
+    } else {
+        // Installs the target into the pinned toolchain if it is missing.
+        status(command("rustup").args(["target", "add", chip.target()]))?;
+    }
+
+    let mut args = vec![
+        "--package",
+        "bleproxy-esp32",
+        "--target",
+        chip.target(),
+        "--features",
+        chip.name(),
+        "--release",
+        "--locked",
+    ];
+    if chip.is_xtensa() {
+        // The Xtensa toolchain ships no prebuilt standard library.
+        args.push("-Zbuild-std=core,alloc");
+    }
+    status(
+        cargo()
+            .arg("clippy")
+            .args(&args)
+            .args(["--", "-D", "warnings"]),
+    )?;
+    status(cargo().arg("build").args(&args))
+}
+
+/// Name of the rustup toolchain that espup installs.
+const XTENSA_TOOLCHAIN: &str = "esp";
+
+/// Fails with setup instructions unless espup's toolchain and linker are
+/// available.
+fn require_xtensa_toolchain(chip: Chip) -> Result {
+    let has_toolchain = command("rustup")
+        .args(["run", XTENSA_TOOLCHAIN, "rustc", "--version"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    let linker = format!("xtensa-{}-elf-gcc", chip.name());
+    let has_linker = Command::new(&linker)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if has_toolchain && has_linker {
+        return Ok(());
+    }
+    Err(format!(
+        "{} needs the esp-rs Xtensa toolchain and the `{linker}` linker. \
+         Install them with `cargo install --locked espup && espup install`, \
+         then load the environment with `. ~/export-esp.sh` (or \
+         `~/export-esp.ps1` on Windows) before running this task",
+        chip.name()
+    )
+    .into())
 }
 
 /// Checks the host workspace with the `rust-version` declared in
@@ -469,6 +596,16 @@ mod tests {
                 parse(name, &[]).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn esp32_defaults_to_c3_and_accepts_known_chips() {
+        assert_eq!(parse("esp32", &[]).unwrap(), Task::Esp32(Chip::Esp32c3));
+        for chip in Chip::ALL {
+            let task = parse("esp32", &[chip.name().into()]).unwrap();
+            assert_eq!(task, Task::Esp32(chip));
+        }
+        assert!(parse("esp32", &["esp8266".into()]).is_err());
     }
 
     #[test]

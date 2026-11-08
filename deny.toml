@@ -9,19 +9,29 @@ targets = [
     "aarch64-unknown-linux-gnu",
     "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-gnu",
+    # Firmware: ESP32-C3 and ESP32-S3.
+    "riscv32imc-unknown-none-elf",
+    "xtensa-esp32s3-none-elf",
 ]
+# Include the dependencies behind every firmware chip feature.
+all-features = true
 
 [advisories]
 # RustSec advisories (vulnerabilities, unsoundness, unmaintained crates).
 # Any match fails the check; an exception must go in `ignore` with a reason.
 unmaintained = "all"
 yanked = "deny"
-ignore = []
+ignore = [
+    # Both are "unmaintained" notices, not vulnerabilities, for crates that
+    # only run at compile time and that we only reach through esp-hal.
+    { id = "RUSTSEC-2024-0436", reason = "paste: proc-macro used by esp-hal and riscv" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: build-time config parsing in esp-config" },
+]
 
 [licenses]
 # Everything must be compatible with distributing bleproxy under
 # MIT OR Apache-2.0. Extend this list deliberately, never with copyleft.
-allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+allow = ["Apache-2.0", "ISC", "MIT", "Unicode-3.0"]
 confidence-threshold = 0.93
 # Fail when an allowed license is no longer used, keeping the list minimal.
 unused-allowed-license = "deny"
@@ -30,6 +40,13 @@ unused-allowed-license = "deny"
 multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
+skip-tree = [
+    # The esp-rs crates deliberately depend on several major versions of the
+    # same crates (embedded-hal 0.2 and 1.0, digest 0.10 and 0.11, ...).
+    # Those duplicates can only be fixed upstream, so they are not checked;
+    # the host graph stays duplicate-free.
+    { crate = "bleproxy-esp32", reason = "duplicates inherited from esp-rs crates" },
+]
 deny = [
     # TLS, when needed, should come from rustls rather than system OpenSSL,
     # which complicates static and cross builds.
