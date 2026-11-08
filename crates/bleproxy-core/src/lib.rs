@@ -9,5 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod address;
+mod advertisement;
 
 pub use address::{AddressError, BdAddr};
+pub use advertisement::{AddressType, AdvData, Advertisement, AdvertisementError};
