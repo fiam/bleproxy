@@ -535,6 +535,8 @@ fn has_subcommand(name: &str) -> bool {
     // which not every plugin implements.
     cargo_command()
         .arg("--list")
+        // Colored output wraps each name in escape codes (CI forces color).
+        .env("CARGO_TERM_COLOR", "never")
         .stderr(Stdio::null())
         .output()
         .is_ok_and(|output| {
@@ -609,6 +611,17 @@ mod tests {
             assert_eq!(task, Task::Esp32(chip));
         }
         assert!(parse("esp32", &["esp8266".into()]).is_err());
+    }
+
+    #[test]
+    fn detects_subcommands() {
+        // Under Wine (`cargo xtask docker windows`) the host's cargo can't be
+        // launched at all; there is nothing to detect there.
+        if cargo_command().arg("--version").output().is_err() {
+            return;
+        }
+        assert!(has_subcommand("build"));
+        assert!(!has_subcommand("no-such-subcommand"));
     }
 
     #[test]
