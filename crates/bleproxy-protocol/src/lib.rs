@@ -14,5 +14,6 @@
 
 mod frame;
 mod varint;
+pub mod wire;
 
 pub use frame::{FrameError, FrameHeader, MAX_HEADER_LEN, PLAINTEXT_INDICATOR};
