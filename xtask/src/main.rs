@@ -299,10 +299,13 @@ fn docs() -> Result {
 }
 
 /// Fails if any manifest is invalid or `Cargo.lock` is out of date.
+///
+/// This resolves the full dependency graph on purpose: with `--no-deps`,
+/// cargo does not check the lockfile against the manifests.
 fn metadata() -> Result {
     status(
         cargo_command()
-            .args(["metadata", "--format-version=1", "--no-deps", "--locked"])
+            .args(["metadata", "--format-version=1", "--locked"])
             .stdout(Stdio::null()),
     )
 }
