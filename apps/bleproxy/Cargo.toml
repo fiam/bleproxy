@@ -14,7 +14,13 @@ categories = ["command-line-utilities", "hardware-support"]
 keywords = ["bluetooth", "ble", "esphome", "home-assistant", "proxy"]
 
 [dependencies]
+bleproxy-core.workspace = true
+bleproxy-protocol.workspace = true
 clap.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
