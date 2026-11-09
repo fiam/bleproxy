@@ -122,6 +122,7 @@ dependencies = [
 name = "bleproxy-core"
 version = "0.1.0"
 dependencies = [
+ "bleproxy-protocol",
  "thiserror",
 ]
 
