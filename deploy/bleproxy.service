@@ -12,6 +12,15 @@
 #   [Service]
 #   Environment=BLEPROXY_NAME=bleproxy-garage
 #   Environment=BLEPROXY_ADAPTER=hci1
+#
+# To encrypt the API, keep the key in a file only root and the service can
+# read, and point the service at it:
+#
+#   openssl rand -base64 32 | \
+#     sudo install -D -m 0640 -g bleproxy /dev/stdin /etc/bleproxy/encryption-key
+#
+#   [Service]
+#   Environment=BLEPROXY_ENCRYPTION_KEY_FILE=/etc/bleproxy/encryption-key
 
 [Unit]
 Description=bleproxy, a Bluetooth LE proxy for Home Assistant

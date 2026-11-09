@@ -64,7 +64,7 @@ struct Cli {
     encryption_key: Option<EncryptionKey>,
 
     /// File holding the encryption key, to keep it out of the environment
-    /// (for example a Docker secret or a systemd credential).
+    /// (for example a Docker secret, or a file only the service can read).
     #[arg(long, env = "BLEPROXY_ENCRYPTION_KEY_FILE")]
     encryption_key_file: Option<PathBuf>,
 

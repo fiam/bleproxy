@@ -14,7 +14,7 @@ Windows, macOS) and microcontrollers (ESP32-C3, ESP32-S3).
 | --- | --- | --- |
 | `crates/bleproxy-core` | BLE domain types, proxy logic | `no_std`, `forbid(unsafe_code)`, no I/O |
 | `crates/bleproxy-protocol` | ESPHome wire format | `no_std`, `forbid(unsafe_code)`, no I/O, no allocation in codecs |
-| `apps/bleproxy` | host app on Tokio: API server, mDNS, BlueZ scanner (Linux) | platform code lives here; lib + thin bin |
+| `apps/bleproxy` | host app on Tokio: API server, transports (plain, Noise), mDNS, scanner control, BlueZ (Linux) | platform code lives here; lib + thin bin |
 | `apps/bleproxy-esp32` | firmware (esp-hal, esp-rtos, Embassy) | not in `default-members`; built via `cargo xtask esp32` |
 | `xtask` | task runner (std only) | no dependencies |
 | `docker/` | test images for `cargo xtask docker` | |
@@ -29,7 +29,7 @@ cargo xtask ci                  # all host checks: fmt, metadata, clippy, msrv, 
 cargo xtask test                # just the tests
 cargo xtask docker windows      # tests for Windows under Wine (also linux-amd64, linux-arm64)
 cargo xtask esp32 [esp32s3]     # firmware lint and build; S3 needs `. ~/export-esp.sh`
-cargo xtask e2e                 # mock BlueZ + bleproxy + aioesphomeapi, both scan modes
+cargo xtask e2e                 # mock BlueZ + bleproxy + aioesphomeapi: scan modes, switching, encryption
 ```
 
 **Definition of done:** `cargo xtask ci` passes. If you touched platform
@@ -103,3 +103,7 @@ code (`apps/bleproxy/src/bluez.rs`) can be linted from other hosts with
   image (the image runs as `nobody`). The image must also set
   `DBUS_SYSTEM_BUS_ADDRESS`, since distroless lacks `/var/run`. The e2e test
   runs a real system bus with BlueZ's policy to catch regressions here.
+- Wire compatibility is checked against aioesphomeapi, Home Assistant's
+  client: protobuf test vectors come from its generated classes, and the e2e
+  test drives the real binary with it. Encryption mismatches must produce the
+  same replies as ESPHome so clients can explain them. Never log keys.
