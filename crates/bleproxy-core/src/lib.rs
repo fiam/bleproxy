@@ -10,6 +10,8 @@
 
 mod address;
 mod advertisement;
+mod uuid;
 
 pub use address::{AddressError, BdAddr};
 pub use advertisement::{AddressType, AdvData, Advertisement, AdvertisementError};
+pub use uuid::{CompactUuid, Uuid, UuidParseError};
