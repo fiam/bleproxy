@@ -130,6 +130,20 @@ pub fn derived_mac(seed: &str) -> BdAddr {
     BdAddr::new(bytes)
 }
 
+/// Checks that `name` can be used as a device name.
+///
+/// # Errors
+///
+/// Returns [`IdentityError::InvalidName`] if it is not a valid host name
+/// label of at most [`MAX_NAME_LEN`] lowercase characters.
+pub fn validate_name(name: &str) -> Result<(), IdentityError> {
+    if is_valid_name(name) {
+        Ok(())
+    } else {
+        Err(IdentityError::InvalidName(name.to_owned()))
+    }
+}
+
 fn is_valid_name(name: &str) -> bool {
     (1..=MAX_NAME_LEN).contains(&name.len())
         && !name.starts_with('-')

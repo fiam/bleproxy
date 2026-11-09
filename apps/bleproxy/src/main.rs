@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use bleproxy::identity::derived_mac;
+use bleproxy::identity::validate_name;
 use bleproxy::mdns::Announcement;
 use bleproxy::{Identity, server};
 use bleproxy_core::BdAddr;
@@ -14,7 +14,7 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tracing::level_filters::LevelFilter;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Bluetooth LE proxy for Home Assistant, speaking the ESPHome Native API.
 #[derive(Debug, Parser)]
@@ -34,6 +34,11 @@ struct Cli {
     /// [default: the Bluetooth adapter's address]
     #[arg(long, env = "BLEPROXY_MAC")]
     mac: Option<BdAddr>,
+
+    /// Bluetooth adapter to scan with.
+    #[cfg(target_os = "linux")]
+    #[arg(long, env = "BLEPROXY_ADAPTER", default_value = "hci0")]
+    adapter: String,
 
     /// Address and port for the ESPHome API.
     #[arg(long, env = "BLEPROXY_LISTEN", default_value = "0.0.0.0:6053")]
@@ -68,12 +73,38 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
-    warn!("Bluetooth scanning is not supported on this platform yet; serving the API only");
-    let mac = cli
-        .mac
-        .unwrap_or_else(|| derived_mac(cli.name.as_deref().unwrap_or("bleproxy")));
-    let identity = Arc::new(Identity::new(cli.name, cli.friendly_name, mac, mac)?);
+    // Catch configuration mistakes before touching the Bluetooth stack.
+    if let Some(name) = &cli.name {
+        validate_name(name)?;
+    }
     let (advertisements, _) = broadcast::channel(1024);
+
+    #[cfg(target_os = "linux")]
+    let bluetooth_mac = {
+        let address = bleproxy::bluez::adapter_address(&cli.adapter)
+            .await
+            .map_err(|err| format!("cannot use Bluetooth adapter {}: {err}", cli.adapter))?;
+        info!(adapter = cli.adapter, %address, "using Bluetooth adapter");
+        tokio::spawn(bleproxy::bluez::scan_forever(
+            cli.adapter.clone(),
+            advertisements.clone(),
+        ));
+        address
+    };
+    #[cfg(not(target_os = "linux"))]
+    let bluetooth_mac = {
+        tracing::warn!(
+            "Bluetooth scanning is not supported on this platform yet; serving the API only"
+        );
+        bleproxy::identity::derived_mac(cli.name.as_deref().unwrap_or("bleproxy"))
+    };
+    let mac = cli.mac.unwrap_or(bluetooth_mac);
+    let identity = Arc::new(Identity::new(
+        cli.name,
+        cli.friendly_name,
+        mac,
+        bluetooth_mac,
+    )?);
 
     let listener = TcpListener::bind(cli.listen).await?;
     let address = listener.local_addr()?;

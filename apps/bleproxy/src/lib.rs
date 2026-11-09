@@ -4,6 +4,8 @@
 //! The binary wires these pieces together; they live in a library so that
 //! integration tests can drive them directly.
 
+#[cfg(target_os = "linux")]
+pub mod bluez;
 pub mod identity;
 pub mod mdns;
 pub mod server;

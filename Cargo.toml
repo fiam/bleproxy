@@ -26,12 +26,15 @@ bleproxy-core = { path = "crates/bleproxy-core" }
 bleproxy-protocol = { path = "crates/bleproxy-protocol" }
 
 clap = { version = "4.6.7", features = ["derive", "env"] }
+futures-util = { version = "0.3.34", default-features = false }
 mdns-sd = "0.21.7"
 # `default-features = false` keeps it usable from `no_std` crates.
 thiserror = { version = "2.0.21", default-features = false }
 tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "fmt", "std"] }
+# Pure Rust, so the BlueZ backend needs no libdbus and links statically.
+zbus = { version = "6.2.1", default-features = false, features = ["tokio"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"
