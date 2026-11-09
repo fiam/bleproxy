@@ -1,0 +1,4 @@
+# systemd-sysusers configuration: the unprivileged user bleproxy runs as.
+#   sudo install -D -m 0644 deploy/bleproxy.sysusers /etc/sysusers.d/bleproxy.conf
+#   sudo systemd-sysusers
+u bleproxy - "bleproxy Bluetooth proxy" - -

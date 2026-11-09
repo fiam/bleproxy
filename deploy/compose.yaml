@@ -1,0 +1,19 @@
+# Docker Compose service for bleproxy.
+#
+#   docker compose -f deploy/compose.yaml up -d
+#
+# Use :latest for releases or :edge for the newest build of main.
+services:
+  bleproxy:
+    image: ghcr.io/fiam/bleproxy:edge
+    restart: unless-stopped
+    # mDNS needs the host's network, and Home Assistant connects to :6053.
+    network_mode: host
+    volumes:
+      # The host's system bus, where BlueZ (bluetoothd) lives.
+      - /run/dbus:/run/dbus:ro
+    environment:
+      BLEPROXY_LOG: info
+      # BLEPROXY_NAME: bleproxy-garage
+      # BLEPROXY_FRIENDLY_NAME: Garage
+      # BLEPROXY_ADAPTER: hci0

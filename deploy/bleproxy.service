@@ -1,0 +1,57 @@
+# systemd unit for running bleproxy on a Linux host.
+#
+#   sudo install -m 0755 bleproxy /usr/local/bin/bleproxy
+#   sudo install -D -m 0644 deploy/bleproxy.sysusers /etc/sysusers.d/bleproxy.conf
+#   sudo systemd-sysusers
+#   sudo install -m 0644 deploy/bleproxy.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now bleproxy
+#
+# Settings go in BLEPROXY_* variables, for example with
+# `sudo systemctl edit bleproxy`:
+#
+#   [Service]
+#   Environment=BLEPROXY_NAME=bleproxy-garage
+#   Environment=BLEPROXY_ADAPTER=hci1
+
+[Unit]
+Description=bleproxy, a Bluetooth LE proxy for Home Assistant
+Documentation=https://github.com/fiam/bleproxy
+Wants=bluetooth.service network-online.target
+After=bluetooth.service network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/bleproxy
+Restart=on-failure
+RestartSec=5
+
+# BlueZ's D-Bus policy lets any user use org.bluez, so no privileges are
+# needed: run as a dedicated user in a locked-down sandbox. (Not
+# DynamicUser: the system bus refuses users it cannot resolve.)
+User=bleproxy
+Group=bleproxy
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+# D-Bus, the API and mDNS, and netlink to follow the host's addresses.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
