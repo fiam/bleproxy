@@ -6,7 +6,10 @@
 //! [`Session::wants_raw_advertisements`] whether the client subscribed.
 //! Likewise, scan mode changes are passed to the platform through
 //! [`Outcome::scan_mode`], and the platform reports its scanner's state
-//! with [`Session::scanner_state`].
+//! with [`Session::scanner_state`]. Operations on device connections reach
+//! the platform as [`Outcome::connection`]; it sends their results, and
+//! the free connection slots once [`Session::wants_connections_free`],
+//! itself.
 
 use bleproxy_protocol::Message;
 use bleproxy_protocol::wire::{Encode, EncodeError};
@@ -17,6 +20,7 @@ use bleproxy_protocol::{
 };
 
 use crate::Advertisement;
+use crate::connection::ConnectionRequest;
 use crate::scanner::{ScanMode, ScannerStatus};
 
 /// How the proxy describes itself to clients.
@@ -46,19 +50,26 @@ pub struct DeviceIdentity<'a> {
     pub scanner: Option<ScanMode>,
     /// Whether the API is encrypted.
     pub encrypted: bool,
+    /// Whether the proxy connects to devices for clients.
+    pub connections: bool,
 }
 
 impl DeviceIdentity<'_> {
     /// Returns the Bluetooth proxy features this proxy offers.
     #[must_use]
     pub const fn feature_flags(&self) -> u32 {
-        let base =
+        let mut flags =
             bluetooth_proxy_feature::PASSIVE_SCAN | bluetooth_proxy_feature::RAW_ADVERTISEMENTS;
         if self.scanner.is_some() {
-            base | bluetooth_proxy_feature::STATE_AND_MODE
-        } else {
-            base
+            flags |= bluetooth_proxy_feature::STATE_AND_MODE;
         }
+        if self.connections {
+            // Services are always resolved by the proxy's Bluetooth stack,
+            // so clients may cache them (and must, to use connections).
+            flags |= bluetooth_proxy_feature::ACTIVE_CONNECTIONS
+                | bluetooth_proxy_feature::REMOTE_CACHING;
+        }
+        flags
     }
 }
 
@@ -75,7 +86,7 @@ pub enum Reply<'a> {
     Disconnect(DisconnectResponse),
     /// Ends the (empty) entity list.
     ListEntitiesDone(ListEntitiesDoneResponse),
-    /// Reports that no active connections are available.
+    /// Reports that no active connections are offered.
     ConnectionsFree(BluetoothConnectionsFreeResponse<'a>),
     /// Reports the scanner's state and mode.
     ScannerState(BluetoothScannerStateResponse),
@@ -133,33 +144,37 @@ impl Reply<'_> {
 }
 
 /// What to do after handling a message.
+///
+/// Replies borrow from the device identity (`'a`), connection requests
+/// from the message (`'m`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Outcome<'a> {
+pub struct Outcome<'a, 'm> {
     /// Message to send back, if any.
     pub reply: Option<Reply<'a>>,
     /// Whether to close the connection (after sending `reply`).
     pub close: bool,
     /// Scan mode the client asked the scanner to switch to.
     pub scan_mode: Option<ScanMode>,
+    /// Operation on a device connection for the platform to carry out.
+    pub connection: Option<ConnectionRequest<&'m [u8]>>,
 }
 
-impl<'a> Outcome<'a> {
+impl<'a> Outcome<'a, '_> {
     const NOTHING: Self = Self {
         reply: None,
         close: false,
         scan_mode: None,
+        connection: None,
     };
     const CLOSE: Self = Self {
-        reply: None,
         close: true,
-        scan_mode: None,
+        ..Self::NOTHING
     };
 
     const fn reply(reply: Reply<'a>) -> Self {
         Self {
             reply: Some(reply),
-            close: false,
-            scan_mode: None,
+            ..Self::NOTHING
         }
     }
 }
@@ -176,6 +191,7 @@ pub struct Session<'a> {
     identity: &'a DeviceIdentity<'a>,
     phase: Phase,
     raw_advertisements: bool,
+    connections_free: bool,
 }
 
 impl<'a> Session<'a> {
@@ -186,6 +202,7 @@ impl<'a> Session<'a> {
             identity,
             phase: Phase::AwaitingHello,
             raw_advertisements: false,
+            connections_free: false,
         }
     }
 
@@ -193,6 +210,13 @@ impl<'a> Session<'a> {
     #[must_use]
     pub const fn wants_raw_advertisements(&self) -> bool {
         self.raw_advertisements
+    }
+
+    /// Returns whether the client wants to follow the free connection
+    /// slots. Only clients of a proxy that offers connections do.
+    #[must_use]
+    pub const fn wants_connections_free(&self) -> bool {
+        self.connections_free
     }
 
     /// Returns the reply that reports `status` to the client, or `None` if
@@ -210,7 +234,7 @@ impl<'a> Session<'a> {
     }
 
     /// Handles one message from the client.
-    pub fn handle(&mut self, message: &ClientMessage<'_>) -> Outcome<'a> {
+    pub fn handle<'m>(&mut self, message: &ClientMessage<'m>) -> Outcome<'a, 'm> {
         let identity = self.identity;
         if self.phase == Phase::AwaitingHello {
             // A session must start with a hello; anything else is a client
@@ -226,9 +250,8 @@ impl<'a> Session<'a> {
             ClientMessage::Hello(_) => Outcome::reply(Reply::Hello(hello_response(identity))),
             ClientMessage::Ping => Outcome::reply(Reply::Ping(PingResponse)),
             ClientMessage::Disconnect => Outcome {
-                reply: Some(Reply::Disconnect(DisconnectResponse)),
                 close: true,
-                scan_mode: None,
+                ..Outcome::reply(Reply::Disconnect(DisconnectResponse))
             },
             ClientMessage::DisconnectResponse => Outcome::CLOSE,
             ClientMessage::DeviceInfo => Outcome::reply(Reply::DeviceInfo(DeviceInfoResponse {
@@ -258,11 +281,19 @@ impl<'a> Session<'a> {
                 self.raw_advertisements = false;
                 Outcome::NOTHING
             }
+            ClientMessage::SubscribeBluetoothConnectionsFree if identity.connections => {
+                self.connections_free = true;
+                Outcome::NOTHING
+            }
             ClientMessage::SubscribeBluetoothConnectionsFree => Outcome::reply(
                 Reply::ConnectionsFree(BluetoothConnectionsFreeResponse::default()),
             ),
             ClientMessage::BluetoothScannerSetMode { mode } => Outcome {
                 scan_mode: identity.scanner.and_then(|_| ScanMode::from_wire(*mode)),
+                ..Outcome::NOTHING
+            },
+            _ if identity.connections => Outcome {
+                connection: ConnectionRequest::from_message(message),
                 ..Outcome::NOTHING
             },
             // No password, no entities, no logs or services to stream.
@@ -312,6 +343,7 @@ mod tests {
         server_info: "bleproxy 0.1.0",
         scanner: None,
         encrypted: false,
+        connections: false,
     };
 
     fn established() -> Session<'static> {
@@ -404,6 +436,64 @@ mod tests {
             }))
         );
         assert_eq!(Session::new(&IDENTITY).scanner_state(status), None);
+    }
+
+    const WITH_CONNECTIONS: DeviceIdentity<'static> = DeviceIdentity {
+        connections: true,
+        ..IDENTITY
+    };
+
+    #[test]
+    fn offers_connections_with_remote_caching() {
+        assert_eq!(WITH_CONNECTIONS.feature_flags(), 0b010_0111);
+    }
+
+    #[test]
+    fn passes_connection_requests_to_the_platform() {
+        let mut session = Session::new(&WITH_CONNECTIONS);
+        session.handle(&ClientMessage::Hello(HelloRequest::default()));
+        let read = ClientMessage::BluetoothGattRead {
+            address: 0xA4C1_3800_1122,
+            handle: 0x2A,
+        };
+        let outcome = session.handle(&read);
+        assert_eq!(
+            outcome.connection,
+            Some(ConnectionRequest::Read {
+                address: BdAddr::new([0xA4, 0xC1, 0x38, 0x00, 0x11, 0x22]),
+                handle: 0x2A,
+            })
+        );
+        assert_eq!((outcome.reply, outcome.close), (None, false));
+
+        // Without connections, requests are ignored.
+        assert_eq!(established().handle(&read), Outcome::NOTHING);
+        // Before the handshake, they end the session like anything else.
+        assert_eq!(
+            Session::new(&WITH_CONNECTIONS).handle(&read),
+            Outcome::CLOSE
+        );
+    }
+
+    #[test]
+    fn leaves_free_slots_to_the_platform_when_offering_connections() {
+        let mut session = Session::new(&WITH_CONNECTIONS);
+        session.handle(&ClientMessage::Hello(HelloRequest::default()));
+        assert!(!session.wants_connections_free());
+        let outcome = session.handle(&ClientMessage::SubscribeBluetoothConnectionsFree);
+        assert_eq!(outcome, Outcome::NOTHING);
+        assert!(session.wants_connections_free());
+
+        // Without connections, the session reports no slots itself.
+        let mut session = established();
+        let outcome = session.handle(&ClientMessage::SubscribeBluetoothConnectionsFree);
+        assert_eq!(
+            outcome.reply,
+            Some(Reply::ConnectionsFree(
+                BluetoothConnectionsFreeResponse::default()
+            ))
+        );
+        assert!(!session.wants_connections_free());
     }
 
     #[test]

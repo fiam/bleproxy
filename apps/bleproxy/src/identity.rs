@@ -143,6 +143,7 @@ impl Identity {
             server_info: &self.server_info,
             scanner: self.scanner,
             encrypted: self.encrypted,
+            connections: false,
         }
     }
 }

@@ -12,6 +12,7 @@
 pub mod ad;
 mod address;
 mod advertisement;
+pub mod connection;
 pub mod scanner;
 pub mod session;
 mod uuid;
