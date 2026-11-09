@@ -4,19 +4,19 @@
 //! sends back the returned [`Reply`], and closes the connection when told
 //! to. Forwarding advertisements is left to the platform, which asks
 //! [`Session::wants_raw_advertisements`] whether the client subscribed.
+//! Likewise, scan mode changes are passed to the platform through
+//! [`Outcome::scan_mode`], and the platform reports its scanner's state
+//! with [`Session::scanner_state`].
 
 use bleproxy_protocol::wire::EncodeError;
 use bleproxy_protocol::{
-    API_VERSION, BluetoothConnectionsFreeResponse, ClientMessage, DeviceInfoResponse,
-    DisconnectResponse, HelloResponse, ListEntitiesDoneResponse, PingResponse, RawAdvertisement,
-    bluetooth_proxy_feature, bluetooth_proxy_subscription, encode_frame,
+    API_VERSION, BluetoothConnectionsFreeResponse, BluetoothScannerStateResponse, ClientMessage,
+    DeviceInfoResponse, DisconnectResponse, HelloResponse, ListEntitiesDoneResponse, PingResponse,
+    RawAdvertisement, bluetooth_proxy_feature, bluetooth_proxy_subscription, encode_frame,
 };
 
 use crate::Advertisement;
-
-/// Bluetooth proxy features this implementation offers.
-pub const FEATURE_FLAGS: u32 =
-    bluetooth_proxy_feature::PASSIVE_SCAN | bluetooth_proxy_feature::RAW_ADVERTISEMENTS;
+use crate::scanner::{ScanMode, ScannerStatus};
 
 /// How the proxy describes itself to clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -39,6 +39,24 @@ pub struct DeviceIdentity<'a> {
     pub version: &'a str,
     /// Free-form server description sent in the hello response.
     pub server_info: &'a str,
+    /// The configured scan mode, if the proxy has a scanner whose mode
+    /// clients may change. Without one, scanner state and mode switching
+    /// are not offered.
+    pub scanner: Option<ScanMode>,
+}
+
+impl DeviceIdentity<'_> {
+    /// Returns the Bluetooth proxy features this proxy offers.
+    #[must_use]
+    pub const fn feature_flags(&self) -> u32 {
+        let base =
+            bluetooth_proxy_feature::PASSIVE_SCAN | bluetooth_proxy_feature::RAW_ADVERTISEMENTS;
+        if self.scanner.is_some() {
+            base | bluetooth_proxy_feature::STATE_AND_MODE
+        } else {
+            base
+        }
+    }
 }
 
 /// A message to send back to the client.
@@ -56,6 +74,8 @@ pub enum Reply<'a> {
     ListEntitiesDone(ListEntitiesDoneResponse),
     /// Reports that no active connections are available.
     ConnectionsFree(BluetoothConnectionsFreeResponse),
+    /// Reports the scanner's state and mode.
+    ScannerState(BluetoothScannerStateResponse),
 }
 
 impl Reply<'_> {
@@ -72,6 +92,7 @@ impl Reply<'_> {
             Self::Disconnect(message) => encode_frame(message, buf),
             Self::ListEntitiesDone(message) => encode_frame(message, buf),
             Self::ConnectionsFree(message) => encode_frame(message, buf),
+            Self::ScannerState(message) => encode_frame(message, buf),
         }
     }
 }
@@ -83,22 +104,27 @@ pub struct Outcome<'a> {
     pub reply: Option<Reply<'a>>,
     /// Whether to close the connection (after sending `reply`).
     pub close: bool,
+    /// Scan mode the client asked the scanner to switch to.
+    pub scan_mode: Option<ScanMode>,
 }
 
 impl<'a> Outcome<'a> {
     const NOTHING: Self = Self {
         reply: None,
         close: false,
+        scan_mode: None,
     };
     const CLOSE: Self = Self {
         reply: None,
         close: true,
+        scan_mode: None,
     };
 
     const fn reply(reply: Reply<'a>) -> Self {
         Self {
             reply: Some(reply),
             close: false,
+            scan_mode: None,
         }
     }
 }
@@ -134,6 +160,20 @@ impl<'a> Session<'a> {
         self.raw_advertisements
     }
 
+    /// Returns the reply that reports `status` to the client, or `None` if
+    /// the proxy has no switchable scanner.
+    #[must_use]
+    pub const fn scanner_state(&self, status: ScannerStatus) -> Option<Reply<'a>> {
+        match self.identity.scanner {
+            Some(configured) => Some(Reply::ScannerState(BluetoothScannerStateResponse {
+                state: status.state.to_wire(),
+                mode: status.mode.to_wire(),
+                configured_mode: configured.to_wire(),
+            })),
+            None => None,
+        }
+    }
+
     /// Handles one message from the client.
     pub fn handle(&mut self, message: &ClientMessage<'_>) -> Outcome<'a> {
         let identity = self.identity;
@@ -153,6 +193,7 @@ impl<'a> Session<'a> {
             ClientMessage::Disconnect => Outcome {
                 reply: Some(Reply::Disconnect(DisconnectResponse)),
                 close: true,
+                scan_mode: None,
             },
             ClientMessage::DisconnectResponse => Outcome::CLOSE,
             ClientMessage::DeviceInfo => Outcome::reply(Reply::DeviceInfo(DeviceInfoResponse {
@@ -162,7 +203,7 @@ impl<'a> Session<'a> {
                 model: identity.model,
                 project_name: identity.project_name,
                 project_version: identity.version,
-                bluetooth_proxy_feature_flags: FEATURE_FLAGS,
+                bluetooth_proxy_feature_flags: identity.feature_flags(),
                 manufacturer: identity.manufacturer,
                 friendly_name: identity.friendly_name,
                 bluetooth_mac_address: identity.bluetooth_mac_address,
@@ -184,6 +225,10 @@ impl<'a> Session<'a> {
             ClientMessage::SubscribeBluetoothConnectionsFree => Outcome::reply(
                 Reply::ConnectionsFree(BluetoothConnectionsFreeResponse::default()),
             ),
+            ClientMessage::BluetoothScannerSetMode { mode } => Outcome {
+                scan_mode: identity.scanner.and_then(|_| ScanMode::from_wire(*mode)),
+                ..Outcome::NOTHING
+            },
             // No password, no entities, no logs or services to stream.
             _ => Outcome::NOTHING,
         }
@@ -229,6 +274,7 @@ mod tests {
         project_name: "fiam.bleproxy",
         version: "0.1.0",
         server_info: "bleproxy 0.1.0",
+        scanner: None,
     };
 
     fn established() -> Session<'static> {
@@ -276,6 +322,51 @@ mod tests {
         assert_eq!(info.bluetooth_mac_address, IDENTITY.bluetooth_mac_address);
         assert_eq!(info.project_name, "fiam.bleproxy");
         assert_eq!(info.bluetooth_proxy_feature_flags, 0b10_0001);
+    }
+
+    const WITH_SCANNER: DeviceIdentity<'static> = DeviceIdentity {
+        scanner: Some(ScanMode::Passive),
+        ..IDENTITY
+    };
+
+    #[test]
+    fn offers_state_and_mode_only_with_a_scanner() {
+        assert_eq!(IDENTITY.feature_flags(), 0b010_0001);
+        assert_eq!(WITH_SCANNER.feature_flags(), 0b110_0001);
+    }
+
+    #[test]
+    fn passes_scan_mode_requests_to_the_platform() {
+        let mut session = Session::new(&WITH_SCANNER);
+        session.handle(&ClientMessage::Hello(HelloRequest::default()));
+        let outcome = session.handle(&ClientMessage::BluetoothScannerSetMode { mode: 1 });
+        assert_eq!(outcome.scan_mode, Some(ScanMode::Active));
+        assert_eq!((outcome.reply, outcome.close), (None, false));
+        // Unknown modes are ignored.
+        let outcome = session.handle(&ClientMessage::BluetoothScannerSetMode { mode: 9 });
+        assert_eq!(outcome.scan_mode, None);
+        // Without a switchable scanner, requests are ignored too.
+        let outcome = established().handle(&ClientMessage::BluetoothScannerSetMode { mode: 1 });
+        assert_eq!(outcome, Outcome::NOTHING);
+    }
+
+    #[test]
+    fn reports_scanner_state_with_the_configured_mode() {
+        use crate::scanner::ScannerState;
+
+        let status = ScannerStatus {
+            state: ScannerState::Running,
+            mode: ScanMode::Active,
+        };
+        assert_eq!(
+            Session::new(&WITH_SCANNER).scanner_state(status),
+            Some(Reply::ScannerState(BluetoothScannerStateResponse {
+                state: 2,
+                mode: 1,
+                configured_mode: 0,
+            }))
+        );
+        assert_eq!(Session::new(&IDENTITY).scanner_state(status), None);
     }
 
     #[test]

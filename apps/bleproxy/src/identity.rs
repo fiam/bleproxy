@@ -108,6 +108,7 @@ impl Identity {
             project_name: Self::PROJECT_NAME,
             version: Self::VERSION,
             server_info: &self.server_info,
+            scanner: None,
         }
     }
 }
