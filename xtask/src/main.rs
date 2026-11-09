@@ -28,6 +28,7 @@ enum Task {
     Msrv,
     Ci,
     Docker(Platform),
+    E2e,
     Esp32(Chip),
     Help,
 }
@@ -59,6 +60,10 @@ const TASKS: &[(&str, &str)] = &[
     (
         "docker <platform>",
         "Run the tests in a container: linux-amd64, linux-arm64 or windows",
+    ),
+    (
+        "e2e",
+        "Run the end-to-end test: mock BlueZ, bleproxy and Home Assistant's client",
     ),
     (
         "esp32 [chip]",
@@ -183,6 +188,7 @@ fn parse(name: &str, args: &[String]) -> Result<Task> {
         "msrv" => Task::Msrv,
         "ci" => Task::Ci,
         "docker" => return parse_docker(args),
+        "e2e" => Task::E2e,
         "esp32" => return parse_esp32(args),
         "help" | "-h" | "--help" => Task::Help,
         _ => return Err(format!("unknown task `{name}`, see `cargo xtask help`").into()),
@@ -244,7 +250,22 @@ fn run(task: Task) -> Result {
         Task::Coverage => coverage(),
         Task::Msrv => msrv(),
         Task::Ci => ci(),
-        Task::Docker(platform) => docker(platform),
+        Task::Docker(platform) => {
+            let mut command = vec!["cargo"];
+            command.extend(platform.test_args());
+            run_in_container(
+                platform.name(),
+                Some(platform.docker_platform()),
+                platform.dockerfile(),
+                &command,
+            )
+        }
+        Task::E2e => run_in_container(
+            "e2e",
+            None,
+            "docker/e2e.Dockerfile",
+            &["sh", "/src/docker/e2e/run.sh"],
+        ),
         Task::Esp32(chip) => esp32(chip),
         Task::Help => {
             help();
@@ -334,25 +355,33 @@ fn coverage() -> Result {
     Ok(())
 }
 
-/// Builds the test image for `platform` and runs the test suite in it.
+/// Builds the image from `dockerfile` and runs `command` in it.
 ///
-/// The source tree is mounted read-only; build output and the crate
-/// registry live in named volumes so repeated runs are incremental.
-fn docker(platform: Platform) -> Result {
+/// The source tree is mounted read-only at `/src`; build output and the
+/// crate registry live in named volumes so repeated runs are incremental.
+/// `platform` selects a non-native architecture, emulated by QEMU.
+fn run_in_container(
+    name: &str,
+    platform: Option<&str>,
+    dockerfile: &str,
+    command: &[&str],
+) -> Result {
     let root = workspace_root().canonicalize()?;
-    let name = platform.name();
     let image = format!("bleproxy-test-{name}");
+    let platform_args = platform.map(|platform| ["--platform", platform]);
     let rust_version = toolchain_channel()?;
     status(
         Command::new("docker")
             .current_dir(&root)
-            .args(["build", "--platform", platform.docker_platform()])
+            .arg("build")
+            .args(platform_args.iter().flatten())
             .args(["--build-arg", &format!("RUST_VERSION={rust_version}")])
-            .args(["--tag", &image, "--file", platform.dockerfile(), "docker"]),
+            .args(["--tag", &image, "--file", dockerfile, "docker"]),
     )?;
     status(
         Command::new("docker")
-            .args(["run", "--rm", "--platform", platform.docker_platform()])
+            .args(["run", "--rm"])
+            .args(platform_args.iter().flatten())
             .args(["--volume", &format!("{}:/src:ro", root.display())])
             .args(["--workdir", "/src"])
             .args(["--volume", &format!("bleproxy-target-{name}:/target")])
@@ -361,8 +390,8 @@ fn docker(platform: Platform) -> Result {
                 "--volume",
                 "bleproxy-cargo-registry:/usr/local/cargo/registry",
             ])
-            .args([&image, "cargo"])
-            .args(platform.test_args()),
+            .arg(&image)
+            .args(command),
     )
 }
 
