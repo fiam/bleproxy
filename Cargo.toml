@@ -26,6 +26,7 @@ bleproxy-core = { path = "crates/bleproxy-core" }
 bleproxy-protocol = { path = "crates/bleproxy-protocol" }
 
 clap = { version = "4.6.7", features = ["derive", "env"] }
+mdns-sd = "0.21.7"
 # `default-features = false` keeps it usable from `no_std` crates.
 thiserror = { version = "2.0.21", default-features = false }
 tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

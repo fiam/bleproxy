@@ -17,6 +17,7 @@ keywords = ["bluetooth", "ble", "esphome", "home-assistant", "proxy"]
 bleproxy-core.workspace = true
 bleproxy-protocol.workspace = true
 clap.workspace = true
+mdns-sd.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

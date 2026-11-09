@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use bleproxy::identity::derived_mac;
+use bleproxy::mdns::Announcement;
 use bleproxy::{Identity, server};
 use bleproxy_core::BdAddr;
 use clap::Parser;
@@ -37,6 +38,11 @@ struct Cli {
     /// Address and port for the ESPHome API.
     #[arg(long, env = "BLEPROXY_LISTEN", default_value = "0.0.0.0:6053")]
     listen: SocketAddr,
+
+    /// Don't announce the proxy over mDNS. Home Assistant then needs the
+    /// address configured by hand.
+    #[arg(long, env = "BLEPROXY_NO_MDNS")]
+    no_mdns: bool,
 
     /// Log level: off, error, warn, info, debug or trace.
     #[arg(long, env = "BLEPROXY_LOG", default_value = "info")]
@@ -70,16 +76,28 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let (advertisements, _) = broadcast::channel(1024);
 
     let listener = TcpListener::bind(cli.listen).await?;
+    let address = listener.local_addr()?;
     info!(
         name = identity.name(),
         mac = identity.mac_address(),
-        address = %listener.local_addr()?,
+        %address,
         "bleproxy {} serving the ESPHome API",
         Identity::VERSION,
     );
-    server::serve(listener, identity, advertisements, shutdown_signal()).await?;
+    let announcement = if cli.no_mdns {
+        None
+    } else {
+        let announcement = Announcement::start(&identity, address.port())?;
+        info!(host = %format_args!("{}.local", identity.name()), "announced over mDNS");
+        Some(announcement)
+    };
+
+    let served = server::serve(listener, identity, advertisements, shutdown_signal()).await;
     info!("shutting down");
-    Ok(())
+    if let Some(announcement) = announcement {
+        tokio::task::spawn_blocking(|| announcement.stop()).await?;
+    }
+    Ok(served?)
 }
 
 /// Completes on Ctrl-C, or on SIGTERM where it exists.

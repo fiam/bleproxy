@@ -5,6 +5,7 @@
 //! integration tests can drive them directly.
 
 pub mod identity;
+pub mod mdns;
 pub mod server;
 
 pub use identity::Identity;
