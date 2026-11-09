@@ -17,6 +17,7 @@ PORT = 6053
 ADAPTER_ADDRESS = "00:01:02:03:04:05"  # what the mock assigns to hci0
 DEVICE_ADDRESS = "A4:C1:38:00:11:22"
 TIMEOUT = 10
+NOBODY = 65534
 
 
 def step(message):
@@ -60,8 +61,12 @@ async def wait_for(advertisements, predicate, what):
 async def main(binary):
     bus, mock = mock_bluez()
     step("starting bleproxy")
+    # Unprivileged, as in deployments: the bus policy must let it in.
     proxy = subprocess.Popen(
-        [binary, "--no-mdns", "--listen", f"127.0.0.1:{PORT}", "--log-level", "debug"]
+        [binary, "--no-mdns", "--listen", f"127.0.0.1:{PORT}", "--log-level", "debug"],
+        user=NOBODY,
+        group=NOBODY,
+        extra_groups=[],
     )
     try:
         client = await connect()

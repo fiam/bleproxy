@@ -1,14 +1,16 @@
 #!/bin/sh
-# Builds bleproxy, starts a private D-Bus with a mock BlueZ on it, and runs
-# the end-to-end test against them. Expects the source tree in /src.
+# Builds bleproxy, starts a system bus with a mock BlueZ on it, and runs the
+# end-to-end test against them. Expects the source tree in /src.
 set -eu
 
 cargo build --locked --package bleproxy
 
-# A private bus stands in for the system bus; bleproxy, dbus-send and
-# dbusmock all honor DBUS_SYSTEM_BUS_ADDRESS.
-DBUS_SYSTEM_BUS_ADDRESS="$(dbus-daemon --session --fork --print-address)"
-export DBUS_SYSTEM_BUS_ADDRESS
+# A real system bus with BlueZ's access rules, so bleproxy faces the same
+# policy as on a host. The mock BlueZ runs as root, like bluetoothd.
+mkdir -p /usr/share/dbus-1/system.d /run/dbus
+cp /src/docker/e2e/bluez-policy.conf /usr/share/dbus-1/system.d/bluez.conf
+dbus-uuidgen --ensure
+dbus-daemon --system --fork
 
 python3 -m dbusmock --system --template bluez5 &
 for _ in $(seq 50); do
