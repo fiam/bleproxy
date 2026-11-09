@@ -39,6 +39,9 @@ unused-allowed-license = "deny"
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
+# Workspace crates reference each other by path only; they are not
+# published, so there is no version requirement to get wrong.
+allow-wildcard-paths = true
 highlight = "all"
 skip-tree = [
     # The esp-rs crates deliberately depend on several major versions of the

@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+# Released as binaries and container images, not on crates.io.
+publish = false
 categories = ["no-std", "embedded", "network-programming"]
 keywords = ["bluetooth", "ble", "esphome", "home-assistant"]
 
