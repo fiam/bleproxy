@@ -25,4 +25,11 @@ LABEL org.opencontainers.image.title="bleproxy" \
       org.opencontainers.image.source="https://github.com/fiam/bleproxy" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 COPY --from=builder /usr/local/bin/bleproxy /usr/local/bin/bleproxy
+# The host's system bus is mounted at /run/dbus. Distroless has no
+# /var/run -> /run link, so the D-Bus default path wouldn't find it.
+ENV DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket
+# The system bus only accepts users the host knows. Distroless's nonroot
+# user (65532) doesn't exist on hosts, but nobody (65534) exists nearly
+# everywhere, and BlueZ's policy lets any user talk to it.
+USER 65534:65534
 ENTRYPOINT ["/usr/local/bin/bleproxy"]
