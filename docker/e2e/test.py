@@ -58,12 +58,58 @@ async def wait_for(advertisements, predicate, what):
     raise AssertionError(f"timed out waiting for {what}")
 
 
-async def main(binary):
+def monitor_properties(bus, pid, root):
+    """Reads bleproxy's advertisement monitor, as BlueZ would."""
+    names = dbus.Interface(
+        bus.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus"),
+        "org.freedesktop.DBus",
+    )
+    for name in names.ListNames():
+        if name.startswith(":") and names.GetConnectionUnixProcessID(name) == pid:
+            manager = dbus.Interface(
+                bus.get_object(name, root), "org.freedesktop.DBus.ObjectManager"
+            )
+            objects = manager.GetManagedObjects()
+            (interfaces,) = objects.values()
+            return interfaces["org.bluez.AdvertisementMonitor1"]
+    raise AssertionError("bleproxy is not on the bus")
+
+
+async def check_scanning_started(bus, mode, pid):
+    async with asyncio.timeout(TIMEOUT):
+        while not {"StartDiscovery", "RegisterMonitor"} & adapter_calls(bus).keys():
+            await asyncio.sleep(0.05)
+    calls = adapter_calls(bus)
+    if mode == "active":
+        discovery_filter = calls["SetDiscoveryFilter"][0]
+        assert discovery_filter["Transport"] == "le", discovery_filter
+        assert discovery_filter["DuplicateData"], discovery_filter
+        assert "RegisterMonitor" not in calls, calls
+    else:
+        assert "StartDiscovery" not in calls, calls
+        (root,) = calls["RegisterMonitor"]
+        monitor = monitor_properties(bus, pid, root)
+        assert monitor["Type"] == "or_patterns", monitor
+        patterns = [(int(s), int(t), bytes(c)) for s, t, c in monitor["Patterns"]]
+        assert (0, 0x01, b"\x06") in patterns, patterns
+
+
+async def main(binary, mode):
+    step(f"testing {mode} scanning")
     bus, mock = mock_bluez()
     step("starting bleproxy")
     # Unprivileged, as in deployments: the bus policy must let it in.
     proxy = subprocess.Popen(
-        [binary, "--no-mdns", "--listen", f"127.0.0.1:{PORT}", "--log-level", "debug"],
+        [
+            binary,
+            "--no-mdns",
+            "--listen",
+            f"127.0.0.1:{PORT}",
+            "--scan-mode",
+            mode,
+            "--log-level",
+            "debug",
+        ],
         user=NOBODY,
         group=NOBODY,
         extra_groups=[],
@@ -84,13 +130,8 @@ async def main(binary):
             lambda response: received.extend(response.advertisements)
         )
 
-        step("checking that discovery was started")
-        async with asyncio.timeout(TIMEOUT):
-            while "StartDiscovery" not in adapter_calls(bus):
-                await asyncio.sleep(0.05)
-        discovery_filter = adapter_calls(bus)["SetDiscoveryFilter"][0]
-        assert discovery_filter["Transport"] == "le", discovery_filter
-        assert discovery_filter["DuplicateData"], discovery_filter
+        step("checking that scanning was started")
+        await check_scanning_started(bus, mode, proxy.pid)
 
         address = int(DEVICE_ADDRESS.replace(":", ""), 16)
         step("adding a device")
@@ -140,8 +181,8 @@ async def main(binary):
         proxy.send_signal(signal.SIGTERM)
         code = proxy.wait(TIMEOUT)
     assert code == 0, f"bleproxy exited with {code}"
-    step("end-to-end test passed")
+    step(f"{mode} scanning passed")
 
 
 if __name__ == "__main__":
-    asyncio.run(main(sys.argv[1]))
+    asyncio.run(main(sys.argv[1], sys.argv[2]))

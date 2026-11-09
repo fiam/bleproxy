@@ -12,13 +12,18 @@ cp /src/docker/e2e/bluez-policy.conf /usr/share/dbus-1/system.d/bluez.conf
 dbus-uuidgen --ensure
 dbus-daemon --system --fork
 
-python3 -m dbusmock --system --template bluez5 &
-for _ in $(seq 50); do
-    if dbus-send --system --dest=org.bluez --print-reply / \
-        org.freedesktop.DBus.Introspectable.Introspect > /dev/null 2>&1; then
-        break
-    fi
-    sleep 0.1
+# Each scan mode gets a fresh mock BlueZ.
+for mode in active passive; do
+    python3 -m dbusmock --system --template bluez5 &
+    mock=$!
+    for _ in $(seq 50); do
+        if dbus-send --system --dest=org.bluez --print-reply / \
+            org.freedesktop.DBus.Introspectable.Introspect > /dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+    /opt/e2e/bin/python /src/docker/e2e/test.py "$CARGO_TARGET_DIR/debug/bleproxy" "$mode"
+    kill "$mock"
+    wait "$mock" || true
 done
-
-exec /opt/e2e/bin/python /src/docker/e2e/test.py "$CARGO_TARGET_DIR/debug/bleproxy"
