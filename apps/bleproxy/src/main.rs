@@ -40,6 +40,14 @@ struct Cli {
     #[arg(long, env = "BLEPROXY_ADAPTER", default_value = "hci0")]
     adapter: String,
 
+    /// Scan mode. Active scanning sends scan requests and sees every
+    /// device; passive scanning only listens, saving battery-powered
+    /// devices energy, but needs BlueZ's advertisement monitor support and
+    /// misses devices that advertise without flags.
+    #[cfg(target_os = "linux")]
+    #[arg(long, env = "BLEPROXY_SCAN_MODE", value_enum, default_value_t)]
+    scan_mode: bleproxy::bluez::ScanMode,
+
     /// Address and port for the ESPHome API.
     #[arg(long, env = "BLEPROXY_LISTEN", default_value = "0.0.0.0:6053")]
     listen: SocketAddr,
@@ -87,6 +95,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         info!(adapter = cli.adapter, %address, "using Bluetooth adapter");
         tokio::spawn(bleproxy::bluez::scan_forever(
             cli.adapter.clone(),
+            cli.scan_mode,
             advertisements.clone(),
         ));
         address

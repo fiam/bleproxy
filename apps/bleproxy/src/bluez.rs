@@ -5,9 +5,17 @@
 //! The scanner follows those changes for one adapter and turns them back
 //! into raw advertisements with [`AdvDataBuilder`].
 //!
-//! Discovery uses `DuplicateData`, so BlueZ reports every advertisement
-//! instead of only changes. It is active discovery: BlueZ sends scan
-//! requests, which also collects scan response data.
+//! Two scan modes are supported:
+//!
+//! - [`ScanMode::Active`] uses regular discovery with `DuplicateData`, so
+//!   BlueZ reports every advertisement. BlueZ sends scan requests, which
+//!   also collects scan response data but costs battery-powered devices
+//!   some energy.
+//! - [`ScanMode::Passive`] registers an advertisement monitor instead, so
+//!   BlueZ only listens. Monitors need patterns; like Home Assistant's own
+//!   passive scanner, the ones used here match the common Flags values,
+//!   so devices that advertise without flags go unseen. It needs a BlueZ
+//!   with the `AdvertisementMonitor` API enabled.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -24,6 +32,22 @@ const ADAPTER: &str = "org.bluez.Adapter1";
 const DEVICE: &str = "org.bluez.Device1";
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 const OBJECT_MANAGER: &str = "org.freedesktop.DBus.ObjectManager";
+const MONITOR_MANAGER: &str = "org.bluez.AdvertisementMonitorManager1";
+
+/// Where the passive scan's advertisement monitor is served.
+const MONITOR_ROOT: &str = "/io/github/fiam/bleproxy";
+const MONITOR_PATH: &str = "/io/github/fiam/bleproxy/monitor0";
+
+/// How BlueZ looks for advertisements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ScanMode {
+    /// Discovery with scan requests: sees every device and its scan
+    /// response data.
+    #[default]
+    Active,
+    /// Listen only, through an advertisement monitor.
+    Passive,
+}
 
 /// How long to wait before restarting a failed scan.
 const RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -79,9 +103,13 @@ pub async fn adapter_address(adapter: &str) -> Result<BdAddr, BluezError> {
 ///
 /// Failures (BlueZ restarting, the adapter disappearing) are logged and the
 /// scan is restarted after a short delay.
-pub async fn scan_forever(adapter: String, sender: broadcast::Sender<Advertisement>) {
+pub async fn scan_forever(
+    adapter: String,
+    mode: ScanMode,
+    sender: broadcast::Sender<Advertisement>,
+) {
     loop {
-        match scan(&adapter, &sender).await {
+        match scan(&adapter, mode, &sender).await {
             Ok(()) => warn!("scan ended unexpectedly"),
             Err(err) => warn!(%err, "scan failed"),
         }
@@ -97,6 +125,7 @@ pub async fn scan_forever(adapter: String, sender: broadcast::Sender<Advertiseme
 /// Returns an error if BlueZ is unreachable or rejects the scan.
 pub async fn scan(
     adapter: &str,
+    mode: ScanMode,
     sender: &broadcast::Sender<Advertisement>,
 ) -> Result<(), BluezError> {
     let connection = Connection::system().await?;
@@ -108,29 +137,11 @@ pub async fn scan(
     let mut removed = signals(&connection, OBJECT_MANAGER, "InterfacesRemoved", "/").await?;
 
     power_on(&connection, &path).await?;
-    let filter = HashMap::from([
-        ("Transport", Variant::from("le")),
-        ("DuplicateData", Variant::from(true)),
-    ]);
-    connection
-        .call_method(
-            Some(BLUEZ),
-            path.as_str(),
-            Some(ADAPTER),
-            "SetDiscoveryFilter",
-            &(filter,),
-        )
-        .await?;
-    connection
-        .call_method(
-            Some(BLUEZ),
-            path.as_str(),
-            Some(ADAPTER),
-            "StartDiscovery",
-            &(),
-        )
-        .await?;
-    info!(adapter, "scanning");
+    match mode {
+        ScanMode::Active => start_discovery(&connection, &path).await?,
+        ScanMode::Passive => register_monitor(&connection, &path).await?,
+    }
+    info!(adapter, ?mode, "scanning");
 
     let mut devices = Devices::new(&path);
     let objects: ManagedObjects = connection
@@ -226,6 +237,91 @@ async fn signals(
         .path_namespace(path_namespace.to_owned())
         .build()?;
     Ok(MessageStream::for_match_rule(rule, connection, None).await?)
+}
+
+async fn start_discovery(connection: &Connection, path: &str) -> Result<(), BluezError> {
+    let filter = HashMap::from([
+        ("Transport", Variant::from("le")),
+        ("DuplicateData", Variant::from(true)),
+    ]);
+    connection
+        .call_method(
+            Some(BLUEZ),
+            path,
+            Some(ADAPTER),
+            "SetDiscoveryFilter",
+            &(filter,),
+        )
+        .await?;
+    connection
+        .call_method(Some(BLUEZ), path, Some(ADAPTER), "StartDiscovery", &())
+        .await?;
+    Ok(())
+}
+
+/// Serves an advertisement monitor and registers it with the adapter,
+/// which makes BlueZ scan passively for it.
+async fn register_monitor(connection: &Connection, path: &str) -> Result<(), BluezError> {
+    let server = connection.object_server();
+    server.at(MONITOR_ROOT, zbus::fdo::ObjectManager).await?;
+    server.at(MONITOR_PATH, Monitor).await?;
+    let root = zbus::ObjectPath::try_from(MONITOR_ROOT)?;
+    connection
+        .call_method(
+            Some(BLUEZ),
+            path,
+            Some(MONITOR_MANAGER),
+            "RegisterMonitor",
+            &(root,),
+        )
+        .await?;
+    Ok(())
+}
+
+/// An `or_patterns` advertisement monitor that matches nearly every
+/// advertisement. BlueZ calls it as it starts and stops monitoring;
+/// matched devices show up as regular device objects either way.
+#[derive(Debug)]
+struct Monitor;
+
+#[allow(
+    clippy::unused_self,
+    clippy::needless_pass_by_value,
+    reason = "zbus interface methods take self and owned arguments"
+)]
+#[zbus::interface(name = "org.bluez.AdvertisementMonitor1")]
+impl Monitor {
+    fn release(&self) {
+        warn!("BlueZ released the advertisement monitor");
+    }
+
+    fn activate(&self) {
+        info!("passive scanning active");
+    }
+
+    fn device_found(&self, device: OwnedObjectPath) {
+        debug!(device = device.as_str(), "monitor found a device");
+    }
+
+    fn device_lost(&self, device: OwnedObjectPath) {
+        debug!(device = device.as_str(), "monitor lost a device");
+    }
+
+    #[zbus(property, name = "Type")]
+    const fn kind(&self) -> &'static str {
+        "or_patterns"
+    }
+
+    /// Patterns as (start position, AD type, content): the Flags values
+    /// Home Assistant's passive scanner matches.
+    #[zbus(property)]
+    fn patterns(&self) -> Vec<(u8, u8, Vec<u8>)> {
+        const FLAGS: u8 = 0x01;
+        [0x02, 0x06, 0x1A]
+            .into_iter()
+            .map(|flags| (0, FLAGS, vec![flags]))
+            .collect()
+    }
 }
 
 async fn power_on(connection: &Connection, path: &str) -> Result<(), BluezError> {

@@ -34,7 +34,7 @@ tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt-multi-
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "fmt", "std"] }
 # Pure Rust, so the BlueZ backend needs no libdbus and links statically.
-zbus = { version = "6.2.1", default-features = false, features = ["tokio"] }
+zbus = { version = "6.2.1", default-features = false, features = ["object-manager", "tokio"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"
