@@ -12,8 +12,9 @@ cp /src/docker/e2e/bluez-policy.conf /usr/share/dbus-1/system.d/bluez.conf
 dbus-uuidgen --ensure
 dbus-daemon --system --fork
 
-# Each scan mode gets a fresh mock BlueZ.
-for mode in active passive; do
+# Each run gets a fresh mock BlueZ: both scan modes, then active scanning
+# over an encrypted API.
+for run in active passive "active encrypted"; do
     python3 -m dbusmock --system --template bluez5 &
     mock=$!
     for _ in $(seq 50); do
@@ -23,7 +24,8 @@ for mode in active passive; do
         fi
         sleep 0.1
     done
-    /opt/e2e/bin/python /src/docker/e2e/test.py "$CARGO_TARGET_DIR/debug/bleproxy" "$mode"
+    # shellcheck disable=SC2086 # the run's words are separate arguments
+    /opt/e2e/bin/python /src/docker/e2e/test.py "$CARGO_TARGET_DIR/debug/bleproxy" $run
     kill "$mock"
     wait "$mock" || true
 done

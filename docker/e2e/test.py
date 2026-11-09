@@ -6,12 +6,15 @@ from bleproxy. Run through `cargo xtask e2e`.
 """
 
 import asyncio
+import base64
+import os
 import signal
 import subprocess
 import sys
 
 import dbus
 from aioesphomeapi import APIClient
+from aioesphomeapi.core import InvalidEncryptionKeyAPIError, RequiresEncryptionAPIError
 from aioesphomeapi.model import BluetoothScannerMode, BluetoothScannerState
 
 PORT = 6053
@@ -39,15 +42,32 @@ def adapter_calls(bus):
     return {str(method): args for _, method, args in calls}
 
 
-async def connect():
-    client = APIClient("127.0.0.1", PORT, password=None)
+async def connect(key=None):
     for _ in range(50):
+        client = APIClient("127.0.0.1", PORT, password=None, noise_psk=key)
         try:
             await client.connect(login=True)
             return client
+        except (InvalidEncryptionKeyAPIError, RequiresEncryptionAPIError):
+            raise
         except Exception:  # noqa: BLE001 - still starting up
             await asyncio.sleep(0.2)
     raise SystemExit("could not connect to bleproxy")
+
+
+async def check_rejections(key):
+    """Clients with the wrong key, or none, are told what is wrong."""
+    wrong = base64.b64encode(os.urandom(32)).decode()
+    for client_key, expected in [
+        (wrong, InvalidEncryptionKeyAPIError),
+        (None, RequiresEncryptionAPIError),
+    ]:
+        try:
+            client = await connect(client_key)
+        except expected:
+            continue
+        await client.disconnect()
+        raise AssertionError(f"expected {expected.__name__} with key {client_key!r}")
 
 
 async def wait_for(advertisements, predicate, what):
@@ -96,9 +116,13 @@ async def check_scanning_started(bus, mode, pid):
         assert (0, 0x01, b"\x06") in patterns, patterns
 
 
-async def main(binary, mode):
-    step(f"testing {mode} scanning")
+async def main(binary, mode, encrypted):
+    step(f"testing {mode} scanning" + (" with encryption" if encrypted else ""))
     bus, mock = mock_bluez()
+    key = base64.b64encode(os.urandom(32)).decode() if encrypted else None
+    env = dict(os.environ)
+    if key:
+        env["BLEPROXY_ENCRYPTION_KEY"] = key
     step("starting bleproxy")
     # Unprivileged, as in deployments: the bus policy must let it in.
     proxy = subprocess.Popen(
@@ -115,15 +139,20 @@ async def main(binary, mode):
         user=NOBODY,
         group=NOBODY,
         extra_groups=[],
+        env=env,
     )
     try:
-        client = await connect()
+        if encrypted:
+            step("checking that wrong keys and plaintext clients are rejected")
+            await check_rejections(key)
+        client = await connect(key)
         step("checking device info")
         info = await client.device_info()
         assert info.bluetooth_mac_address == ADAPTER_ADDRESS, info
         assert info.mac_address == ADAPTER_ADDRESS, info
         assert info.name == "bleproxy-030405", info
         assert info.project_name == "fiam.bleproxy", info
+        assert info.api_encryption_supported == encrypted, info
         flags = info.bluetooth_proxy_feature_flags_compat(client.api_version)
         # Passive scan, raw advertisements, and state and mode.
         assert flags == 0b110_0001, flags
@@ -221,4 +250,4 @@ async def main(binary, mode):
 
 
 if __name__ == "__main__":
-    asyncio.run(main(sys.argv[1], sys.argv[2]))
+    asyncio.run(main(sys.argv[1], sys.argv[2], "encrypted" in sys.argv[3:]))
