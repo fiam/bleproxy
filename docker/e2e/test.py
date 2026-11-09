@@ -1,8 +1,9 @@
 """End-to-end test: mock BlueZ -> bleproxy -> aioesphomeapi.
 
 Drives a python-dbusmock BlueZ the way a real adapter would report
-advertisements, and checks that Home Assistant's API client receives them
-from bleproxy. Run through `cargo xtask e2e`.
+advertisements and serve a device's GATT database, and checks that Home
+Assistant's API client receives the advertisements and can use the device
+through bleproxy. Run through `cargo xtask e2e`.
 """
 
 import asyncio
@@ -14,7 +15,11 @@ import sys
 
 import dbus
 from aioesphomeapi import APIClient
-from aioesphomeapi.core import InvalidEncryptionKeyAPIError, RequiresEncryptionAPIError
+from aioesphomeapi.core import (
+    BluetoothGATTAPIError,
+    InvalidEncryptionKeyAPIError,
+    RequiresEncryptionAPIError,
+)
 from aioesphomeapi.model import BluetoothScannerMode, BluetoothScannerState
 
 PORT = 6053
@@ -23,6 +28,14 @@ DEVICE_ADDRESS = "A4:C1:38:00:11:22"
 TIMEOUT = 10
 MODES = {"active": BluetoothScannerMode.ACTIVE, "passive": BluetoothScannerMode.PASSIVE}
 NOBODY = 65534
+MOCK = "org.freedesktop.DBus.Mock"
+GATT_SERVICE = "org.bluez.GattService1"
+GATT_CHARACTERISTIC = "org.bluez.GattCharacteristic1"
+GATT_DESCRIPTOR = "org.bluez.GattDescriptor1"
+
+
+def uuid16(alias):
+    return f"0000{alias:04x}-0000-1000-8000-00805f9b34fb"
 
 
 def step(message):
@@ -37,9 +50,170 @@ def mock_bluez():
 
 
 def adapter_calls(bus):
-    adapter = bus.get_object("org.bluez", "/org/bluez/hci0")
-    calls = dbus.Interface(adapter, "org.freedesktop.DBus.Mock").GetCalls()
-    return {str(method): args for _, method, args in calls}
+    return {str(method): args for method, args in calls(bus, "/org/bluez/hci0")}
+
+
+def calls(bus, path):
+    """The methods called on a mock object, in order, with their arguments."""
+    mock = dbus.Interface(bus.get_object("org.bluez", path), MOCK)
+    return [(str(method), args) for _, method, args in mock.GetCalls()]
+
+
+async def wait_for_call(bus, path, method, count=1):
+    async with asyncio.timeout(TIMEOUT):
+        while True:
+            made = [args for name, args in calls(bus, path) if name == method]
+            if len(made) >= count:
+                return made[count - 1]
+            await asyncio.sleep(0.05)
+
+
+def add_gatt_database(bus, device):
+    """Exports a battery service the way BlueZ does once it has resolved a
+    device's services: object paths end in the attribute handles."""
+    root = dbus.Interface(bus.get_object("org.bluez", "/"), MOCK)
+    service = f"{device}/service0028"
+    level = f"{service}/char0029"
+    secret = f"{service}/char002d"
+    root.AddObject(service, GATT_SERVICE, {
+        "UUID": uuid16(0x180F),
+        "Device": dbus.ObjectPath(device),
+        "Primary": True,
+    }, [])
+    # Like BlueZ, reads update Value, which looks just like a notification.
+    root.AddObject(level, GATT_CHARACTERISTIC, {
+        "UUID": uuid16(0x2A19),
+        "Service": dbus.ObjectPath(service),
+        "Flags": dbus.Array(["read", "write", "write-without-response", "notify"], signature="s"),
+        "MTU": dbus.UInt16(247),
+        "Value": dbus.Array([], signature="y"),
+    }, [
+        ("ReadValue", "a{sv}", "ay",
+         "self.Set('org.bluez.GattCharacteristic1', 'Value', dbus.Array([0x64], signature='y'))\n"
+         "ret = dbus.Array([0x64], signature='y')"),
+        ("WriteValue", "aya{sv}", "", ""),
+        ("StartNotify", "", "", ""),
+        ("StopNotify", "", "", ""),
+    ])
+    for handle, uuid, value in [(0x2B, 0x2902, b"\x00\x00"), (0x2C, 0x2901, b"Battery")]:
+        root.AddObject(f"{level}/desc{handle:04x}", GATT_DESCRIPTOR, {
+            "UUID": uuid16(uuid),
+            "Characteristic": dbus.ObjectPath(level),
+            "Value": dbus.Array(value, signature="y"),
+        }, [
+            ("ReadValue", "a{sv}", "ay", f"ret = dbus.Array({list(value)!r}, signature='y')"),
+            ("WriteValue", "aya{sv}", "", ""),
+        ])
+    root.AddObject(secret, GATT_CHARACTERISTIC, {
+        "UUID": uuid16(0x2A00),
+        "Service": dbus.ObjectPath(service),
+        "Flags": dbus.Array(["read"], signature="s"),
+        "Value": dbus.Array([], signature="y"),
+    }, [
+        ("ReadValue", "a{sv}", "ay",
+         "raise dbus.exceptions.DBusException('Read not permitted', "
+         "name='org.bluez.Error.NotPermitted')"),
+    ])
+    return level
+
+
+async def resolve_services_on_connect(bus, device, count):
+    """Plays BlueZ: once bleproxy connects, report the services resolved."""
+    await wait_for_call(bus, device, "Connect", count)
+    mock = dbus.Interface(bus.get_object("org.bluez", device), MOCK)
+    mock.UpdateProperties("org.bluez.Device1", {"ServicesResolved": True})
+
+
+async def check_connections(bus, client, device, flags):
+    address = int(DEVICE_ADDRESS.replace(":", ""), 16)
+    level = add_gatt_database(bus, device)
+
+    slots = []
+    client.subscribe_bluetooth_connections_free(lambda *update: slots.append(update))
+    await wait_for(slots, lambda s: s == (3, 3, []), "the free slots")
+
+    step("connecting to the device")
+    states = []
+    resolving = asyncio.create_task(resolve_services_on_connect(bus, device, 1))
+    await client.bluetooth_device_connect(
+        address,
+        lambda *state: states.append(state),
+        feature_flags=flags,
+        address_type=0,
+    )
+    await resolving
+    assert states == [(True, 247, 0)], states
+    await wait_for(slots, lambda s: s == (2, 3, [address]), "the slot to be taken")
+
+    step("listing its services")
+    services = (await client.bluetooth_gatt_get_services(address)).services
+    assert [(s.uuid, s.handle) for s in services] == [(uuid16(0x180F), 0x28)], services
+    characteristics = services[0].characteristics
+    # Characteristics go by their value handle, one past the declaration's.
+    assert [(c.uuid, c.handle, c.properties) for c in characteristics] == [
+        (uuid16(0x2A19), 0x2A, 0x1E),
+        (uuid16(0x2A00), 0x2E, 0x02),
+    ], characteristics
+    descriptors = characteristics[0].descriptors
+    assert [(d.uuid, d.handle) for d in descriptors] == [
+        (uuid16(0x2902), 0x2B),
+        (uuid16(0x2901), 0x2C),
+    ], descriptors
+
+    step("reading and writing")
+    assert await client.bluetooth_gatt_read(address, 0x2A) == b"\x64"
+    assert await client.bluetooth_gatt_read_descriptor(address, 0x2C) == b"Battery"
+    await client.bluetooth_gatt_write(address, 0x2A, b"\x01\x02", response=True)
+    await client.bluetooth_gatt_write(address, 0x2A, b"\x03", response=False)
+    data, options = await wait_for_call(bus, level, "WriteValue", 2)
+    assert bytes(data) == b"\x03" and options["type"] == "command", (data, options)
+    data, options = (await wait_for_call(bus, level, "WriteValue", 1))
+    assert bytes(data) == b"\x01\x02" and options["type"] == "request", (data, options)
+    try:
+        await client.bluetooth_gatt_read(address, 0x2E)
+        raise AssertionError("reading a protected characteristic should fail")
+    except BluetoothGATTAPIError as err:
+        assert err.error.error == 2, err  # read not permitted
+
+    step("receiving notifications")
+    notifications = []
+    await client.bluetooth_gatt_start_notify(
+        address, 0x2A, lambda handle, data: notifications.append(bytes(data))
+    )
+    await wait_for_call(bus, level, "StartNotify")
+    # Clients configure the CCCD after asking for notifications; BlueZ does
+    # that itself and refuses the write, so bleproxy must not pass it on.
+    await client.bluetooth_gatt_write_descriptor(address, 0x2B, b"\x01\x00")
+    descriptor_writes = calls(bus, f"{level}/desc002b")
+    assert not descriptor_writes, descriptor_writes
+    # A read changes Value too, but must not pass for a notification.
+    assert await client.bluetooth_gatt_read(address, 0x2A) == b"\x64"
+    characteristic = dbus.Interface(bus.get_object("org.bluez", level), MOCK)
+    characteristic.EmitSignal(
+        "org.freedesktop.DBus.Properties",
+        "PropertiesChanged",
+        "sa{sv}as",
+        [
+            GATT_CHARACTERISTIC,
+            {"Value": dbus.Array([0x63], signature="y", variant_level=1)},
+            dbus.Array([], signature="s"),
+        ],
+    )
+    await wait_for(notifications, lambda n: True, "a notification")
+    assert notifications == [b"\x63"], notifications
+
+    step("disconnecting")
+    await client.bluetooth_device_disconnect(address)
+    await wait_for(slots, lambda s: s == (3, 3, []), "the slot to be freed")
+
+    step("releasing devices of clients that go away")
+    resolving = asyncio.create_task(resolve_services_on_connect(bus, device, 2))
+    await client.bluetooth_device_connect(
+        address, lambda *state: None, feature_flags=flags, address_type=0
+    )
+    await resolving
+    await client.disconnect()
+    await wait_for_call(bus, device, "Disconnect", 2)
 
 
 async def connect(key=None):
@@ -247,7 +421,7 @@ async def main(binary, mode, encrypted):
         mock.AddDevice("hci0", "A4:C1:38:00:33:44", "ATC_3344")
         await wait_for(received, lambda a: a.address == second, "the second device")
 
-        await client.disconnect()
+        await check_connections(bus, client, path, flags)
     finally:
         step("stopping bleproxy")
         proxy.send_signal(signal.SIGTERM)
