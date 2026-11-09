@@ -175,11 +175,13 @@ jobs:
       - run: docker run --rm bleproxy:ci --version
 
   # Publish ghcr.io/<owner>/bleproxy:edge for testing unreleased changes,
-  # once every check on main has passed.
+  # once every check of the host application on main has passed. Firmware
+  # jobs don't gate it: they don't affect the image, and the Xtensa
+  # toolchain download is prone to transient failures.
   edge:
     name: Edge image
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [fmt, lint, test, msrv, e2e, docs, deny, deps, esp32c3, esp32s3, image]
+    needs: [fmt, lint, test, msrv, e2e, docs, deny, deps, image]
     permissions:
       contents: read
       packages: write
