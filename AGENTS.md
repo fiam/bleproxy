@@ -14,7 +14,7 @@ Windows, macOS) and microcontrollers (ESP32-C3, ESP32-S3).
 | --- | --- | --- |
 | `crates/bleproxy-core` | BLE domain types, proxy logic | `no_std`, `forbid(unsafe_code)`, no I/O |
 | `crates/bleproxy-protocol` | ESPHome wire format | `no_std`, `forbid(unsafe_code)`, no I/O, no allocation in codecs |
-| `apps/bleproxy` | host binary (clap; Tokio once needed) | platform code lives here |
+| `apps/bleproxy` | host app on Tokio: API server, mDNS, BlueZ scanner (Linux) | platform code lives here; lib + thin bin |
 | `apps/bleproxy-esp32` | firmware (esp-hal, esp-rtos, Embassy) | not in `default-members`; built via `cargo xtask esp32` |
 | `xtask` | task runner (std only) | no dependencies |
 | `docker/` | test images for `cargo xtask docker` | |
@@ -29,16 +29,20 @@ cargo xtask ci                  # all host checks: fmt, metadata, clippy, msrv, 
 cargo xtask test                # just the tests
 cargo xtask docker windows      # tests for Windows under Wine (also linux-amd64, linux-arm64)
 cargo xtask esp32 [esp32s3]     # firmware lint and build; S3 needs `. ~/export-esp.sh`
+cargo xtask e2e                 # mock BlueZ + bleproxy + aioesphomeapi, both scan modes
 ```
 
 **Definition of done:** `cargo xtask ci` passes. If you touched platform
-code, the relevant `docker` or `esp32` task passes too.
+code, the relevant `docker`, `e2e` or `esp32` task passes too. Linux-only
+code (`apps/bleproxy/src/bluez.rs`) can be linted from other hosts with
+`cargo clippy --target aarch64-unknown-linux-gnu --all-targets`.
 
 ## Rules
 
 - **Layering.**
-  - Shared crates must not depend on an OS, an async runtime or a radio. Put
-    platform behavior in `apps/*` behind traits owned by the shared crates.
+  - Shared crates must not depend on an OS, an async runtime or a radio. They
+    are sans-I/O: types, codecs and state machines (like `Session`) that the
+    apps feed. Add a trait to a shared crate only once two platforms need it.
   - Don't add `#[cfg(target_os = ...)]` to shared crates.
 - **Errors.**
   - Return typed errors (`thiserror`, `default-features = false`).
@@ -94,3 +98,8 @@ code, the relevant `docker` or `esp32` task passes too.
   `rust-toolchain.toml`. An xtask test checks it.
 - GitHub Actions are pinned to commit SHAs with a version comment. Keep both
   in sync when updating by hand (Dependabot normally does it).
+- The system bus only accepts users it can resolve, which rules out
+  `DynamicUser=` in the systemd unit and distroless's `nonroot` user in the
+  image (the image runs as `nobody`). The image must also set
+  `DBUS_SYSTEM_BUS_ADDRESS`, since distroless lacks `/var/run`. The e2e test
+  runs a real system bus with BlueZ's policy to catch regressions here.

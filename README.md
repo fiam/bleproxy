@@ -14,10 +14,12 @@ $5 ESP32, all speaking the [ESPHome Native API][esphome-api].
 
 </div>
 
-> [!WARNING]
-> **Early days.** This repository is the project's foundation: workspace,
-> tooling, CI and release automation, plus the first shared types. It does
-> **not** proxy Bluetooth traffic yet. See the [roadmap](#roadmap).
+> [!NOTE]
+> **Early, but working on Linux.** On a Linux host with BlueZ, bleproxy
+> already acts as a passive Bluetooth proxy for Home Assistant: it is
+> discovered automatically and forwards advertisements. Active connections
+> (GATT), encryption and Bluetooth scanning on Windows, macOS and ESP32 are
+> still to come. See the [roadmap](#roadmap).
 
 ## Why
 
@@ -53,18 +55,100 @@ flowchart LR
 
 ## Platform support
 
-| Target | Binary | Status | BLE backend (planned) |
+| Target | Binary | Status | BLE backend |
 | --- | --- | --- | --- |
-| Linux (x86_64, aarch64) | `bleproxy` | 🏗️ scaffold | BlueZ over D-Bus |
-| Windows (x86_64) | `bleproxy` | 🏗️ scaffold | WinRT |
-| macOS (Apple silicon) | `bleproxy` | 🏗️ scaffold, development host | CoreBluetooth |
-| ESP32-C3 (RISC-V) | `bleproxy-esp32` | 🏗️ boots, prints banner | [TrouBLE] + esp-radio |
-| ESP32-S3 (Xtensa) | `bleproxy-esp32` | 🏗️ boots, prints banner | [TrouBLE] + esp-radio |
+| Linux (x86_64, aarch64) | `bleproxy` | ✅ passive proxy | BlueZ over D-Bus (active or passive scanning) |
+| Windows (x86_64) | `bleproxy` | 🏗️ API only, no scanning yet | WinRT (planned) |
+| macOS (Apple silicon) | `bleproxy` | 🏗️ API only, no scanning yet | CoreBluetooth (planned) |
+| ESP32-C3 (RISC-V) | `bleproxy-esp32` | 🏗️ boots, prints banner | [TrouBLE] + esp-radio (planned) |
+| ESP32-S3 (Xtensa) | `bleproxy-esp32` | 🏗️ boots, prints banner | [TrouBLE] + esp-radio (planned) |
 
 Every target is built in CI on every change. Linux and Windows test suites
 also run locally in containers (see [Cross-platform testing](#cross-platform-testing)).
 
-## Getting started
+## Running it on a Linux server
+
+You need a Linux host with a Bluetooth adapter, BlueZ (`bluetoothd`) running
+and the host on the same network as Home Assistant. Check the adapter with
+`bluetoothctl show`.
+
+### With Docker
+
+```sh
+docker run -d --name bleproxy --restart unless-stopped \
+  --network host \
+  -v /run/dbus:/run/dbus:ro \
+  ghcr.io/fiam/bleproxy:edge
+```
+
+or `docker compose -f deploy/compose.yaml up -d` with
+[`deploy/compose.yaml`](deploy/compose.yaml). Host networking lets Home
+Assistant discover the proxy over mDNS. The read-only `/run/dbus` mount gives
+access to BlueZ. The image runs unprivileged, as `nobody`.
+
+Images are published for `linux/amd64` and `linux/arm64`: `:edge` follows
+`main`, `:latest` and `:X.Y.Z` are releases.
+
+### As a systemd service
+
+Download a binary from the [releases][release] or build one
+(`cargo install --locked --git https://github.com/fiam/bleproxy bleproxy`),
+then install it with the unit and the user it runs as:
+
+```sh
+sudo install -m 0755 bleproxy /usr/local/bin/bleproxy
+sudo install -D -m 0644 deploy/bleproxy.sysusers /etc/sysusers.d/bleproxy.conf
+sudo systemd-sysusers
+sudo install -m 0644 deploy/bleproxy.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now bleproxy
+journalctl -u bleproxy -f
+```
+
+The [unit](deploy/bleproxy.service) runs as an unprivileged user in a tight
+sandbox (`systemd-analyze security` rates it 1.5).
+
+### Adding it to Home Assistant
+
+Home Assistant discovers the proxy through the ESPHome integration: accept
+the notification under **Settings → Devices & services**. If mDNS doesn't
+reach Home Assistant, add an **ESPHome** device by hand with the server's
+address and port 6053, and leave the encryption key empty.
+
+Once added, the proxy shows up under **Settings → Bluetooth** as a remote
+scanner, and Bluetooth devices near the server appear in Home Assistant.
+
+### Configuration
+
+Every option is a command-line flag and a `BLEPROXY_*` environment variable:
+
+| Flag | Environment | Default | Meaning |
+| --- | --- | --- | --- |
+| `--name` | `BLEPROXY_NAME` | `bleproxy-<mac suffix>` | Device and mDNS host name (lowercase letters, digits, hyphens) |
+| `--friendly-name` | `BLEPROXY_FRIENDLY_NAME` | `bleproxy <MAC SUFFIX>` | Name shown in Home Assistant |
+| `--adapter` | `BLEPROXY_ADAPTER` | `hci0` | Bluetooth adapter to scan with |
+| `--scan-mode` | `BLEPROXY_SCAN_MODE` | `active` | `active` or `passive` (see below) |
+| `--mac` | `BLEPROXY_MAC` | the adapter's address | Address identifying the proxy in Home Assistant |
+| `--listen` | `BLEPROXY_LISTEN` | `0.0.0.0:6053` | Address and port of the ESPHome API |
+| `--no-mdns` | `BLEPROXY_NO_MDNS` | off | Don't announce the proxy over mDNS |
+| `--log-level` | `BLEPROXY_LOG` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
+
+**Scan modes.** `active` (BlueZ discovery) sends scan requests, so it sees
+every device along with its scan response data. `passive` only listens,
+through a BlueZ advertisement monitor, which spares battery-powered devices
+the extra radio traffic. Like Home Assistant's own passive scanning, it
+matches advertisements by their flags, so devices that advertise without
+flags are not seen, and it needs a BlueZ with the advertisement monitor API
+(older releases only enable it with `bluetoothd --experimental`).
+
+### Troubleshooting
+
+- **No advertisements:** run with `BLEPROXY_LOG=debug`, check
+  `bluetoothctl show` (powered, not blocked by `rfkill`), and in passive mode
+  look for errors registering the monitor; try `--scan-mode active`.
+- **Cannot use Bluetooth adapter:** BlueZ isn't reachable. Check that
+  `bluetoothd` runs and, in Docker, that `/run/dbus` is mounted.
+- **Not discovered:** mDNS must reach Home Assistant (same network or VLAN
+  reflector, port 5353/udp open), or add the device by hand.
 
 ### Prebuilt binaries
 
@@ -76,62 +160,56 @@ and macOS (Apple silicon), with SHA-256 checksums and
 gh attestation verify bleproxy-v0.1.0-x86_64-unknown-linux-gnu.tar.gz --repo fiam/bleproxy
 ```
 
-### Container
-
-Multi-arch images (`linux/amd64`, `linux/arm64`) are published to the GitHub
-Container Registry. The image is distroless and runs as a non-root user:
-
-```sh
-docker run --rm ghcr.io/fiam/bleproxy:latest --version
-```
-
-When the BlueZ backend lands, the container will need the host's D-Bus socket
-and host networking, so Home Assistant can discover it:
-
-```sh
-docker run -d --name bleproxy --network host \
-  -v /run/dbus:/run/dbus:ro \
-  ghcr.io/fiam/bleproxy:latest
-```
-
 ### From source
 
 ```sh
 git clone https://github.com/fiam/bleproxy && cd bleproxy
-cargo run -p bleproxy -- --version
+cargo run -p bleproxy -- --help
 ```
 
 [rustup] installs the pinned toolchain from `rust-toolchain.toml`
-automatically.
+automatically. On macOS and Windows the binary serves the API without
+scanning, which is handy for development.
 
 ## Architecture
 
 ```text
 bleproxy/
 ├── crates/
-│   ├── bleproxy-core/       # no_std: BLE domain types and proxy logic
+│   ├── bleproxy-core/       # no_std: BLE types, advertising data, API session logic
 │   └── bleproxy-protocol/   # no_std: ESPHome Native API framing and messages
 ├── apps/
-│   ├── bleproxy/            # host binary (Linux, Windows, macOS)
+│   ├── bleproxy/            # host app (Linux, Windows, macOS)
+│   │   └── src/             # server, mdns, bluez (Linux), identity, main
 │   └── bleproxy-esp32/      # firmware (ESP32-C3, ESP32-S3)
-├── xtask/                   # development task runner: `cargo xtask`
-└── docker/                  # containers for cross-platform test runs
+├── deploy/                  # systemd unit, sysusers config, Compose file
+├── docker/                  # containers for cross-platform and end-to-end tests
+└── xtask/                   # development task runner: `cargo xtask`
 ```
 
 The split follows one rule: **shared crates never touch hardware or
 sockets.**
 
-- **`bleproxy-core`** owns the platform-neutral model (addresses,
-  advertisements, and eventually proxy state). It is `#![no_std]`, forbids
-  `unsafe`, and keeps advertisements in fixed-size buffers so the scan hot path
-  never allocates.
-- **`bleproxy-protocol`** owns the wire format. It is also `#![no_std]`. Its
-  frame codec reads and writes caller-provided buffers, so the same code serves
-  a Tokio socket and an Embassy TCP stack.
-- **`apps/*`** are thin shells. They pick a runtime (Tokio on hosts, Embassy on
-  microcontrollers), adapt the native BLE stack to core types, and wire
-  everything together. Platform code goes behind traits defined by the shared
-  crates, not behind `#[cfg]` in them.
+- **`bleproxy-protocol`** owns the wire format: plaintext frames and the
+  protobuf messages a passive Bluetooth proxy exchanges, encoded and decoded
+  without allocating into caller-provided buffers. It is `#![no_std]`, so the
+  same code can serve a Tokio socket and an Embassy TCP stack.
+- **`bleproxy-core`** owns the proxy's behavior: device addresses, UUIDs and
+  advertisements (in fixed-size buffers, so the scan path never allocates),
+  rebuilding advertising data from parsed fields, and the API `Session`, a
+  sans-I/O state machine that turns client messages into replies. It is
+  `#![no_std]` and forbids `unsafe`.
+- **`apps/bleproxy`** is the I/O around them, on Tokio:
+  - `server` accepts API connections, drives a `Session` per client and
+    forwards batched advertisements to subscribers.
+  - `mdns` announces the proxy like an ESPHome device.
+  - `bluez` (Linux) follows BlueZ over D-Bus and publishes advertisements on
+    a broadcast channel.
+
+  It is a library plus a thin binary, so integration tests drive the server
+  directly.
+- **`apps/bleproxy-esp32`** boots the chip with Embassy; its BLE and network
+  stacks will feed the same core types.
 
 The firmware is a workspace member, but it is excluded from `default-members`.
 Plain `cargo build`/`test`/`clippy` therefore stay host-only and never need an
@@ -174,6 +252,7 @@ Rust program, so they work identically on Linux, macOS and Windows, with no
 | `cargo xtask deps` | Find unused dependencies ([cargo-machete]) |
 | `cargo xtask coverage` | Write an lcov report to `lcov.info` |
 | `cargo xtask docker <platform>` | Run the test suite in a container |
+| `cargo xtask e2e` | End-to-end test: mock BlueZ, bleproxy and Home Assistant's client |
 | `cargo xtask esp32 [chip]` | Lint and build the firmware |
 | `cargo xtask ci` | Everything CI runs on the host |
 
@@ -190,6 +269,18 @@ suite in it:
 
 The source tree is mounted read-only. Build artifacts are cached in Docker
 volumes, so repeat runs are incremental.
+
+### End-to-end test
+
+`cargo xtask e2e` exercises the whole Linux path without Bluetooth hardware,
+in both scan modes:
+
+- A container runs a real system bus with BlueZ's access rules and a mock
+  BlueZ (python-dbusmock).
+- bleproxy runs against it as an unprivileged user.
+- aioesphomeapi, the client library Home Assistant uses, checks the device
+  info and that new and updated devices arrive as the expected raw
+  advertisements.
 
 ### Firmware
 
@@ -260,15 +351,15 @@ Releases are fully automated with [release-please]:
 
 - [x] Workspace, lint policy, CI, supply-chain checks
 - [x] Release automation: binaries, multi-arch images, provenance
-- [x] Core BLE types and ESPHome plaintext frame codec
+- [x] ESPHome Native API server: hello, device info, raw advertisement forwarding
+- [x] mDNS announcement so Home Assistant discovers the proxy
+- [x] BLE scanning on Linux through BlueZ, active or passive
 - [x] Firmware boots on ESP32-C3 and ESP32-S3
-- [ ] Passive BLE scanning on Linux (BlueZ)
-- [ ] ESPHome Native API server: hello, device info, raw advertisement forwarding
-- [ ] mDNS advertisement so Home Assistant discovers the proxy
+- [ ] Scanner state and mode switching from Home Assistant
 - [ ] Noise encryption (ESPHome API encryption keys)
-- [ ] Windows backend
-- [ ] BLE scanning on ESP32 via esp-radio and TrouBLE
 - [ ] Active connections (GATT proxying)
+- [ ] Windows and macOS backends
+- [ ] BLE scanning on ESP32 via esp-radio and TrouBLE
 
 ## Acknowledgements
 

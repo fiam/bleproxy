@@ -36,8 +36,9 @@ platform-specific code should also run the relevant
 - **Keep the layers apart.**
   - `bleproxy-core` and `bleproxy-protocol` are `no_std` and must not depend on
     an OS, a runtime or a radio.
-  - Platform code lives in `apps/*`, behind traits defined by the shared
-    crates. Don't put `#[cfg(target_os = ...)]` in shared code.
+  - Platform code lives in `apps/*` and drives the shared, sans-I/O types
+    and state machines. Don't put `#[cfg(target_os = ...)]` in shared code,
+    and add shared traits only once two platforms need them.
 - **No placeholders.** Don't add stub implementations, `todo!()` or speculative
   abstractions. Add code together with its first real use and its tests.
 
