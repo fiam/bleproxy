@@ -103,6 +103,45 @@ impl AdvData {
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// Returns the number of bytes that can still be appended.
+    pub(crate) const fn remaining(&self) -> usize {
+        Self::MAX_LEN - self.len()
+    }
+
+    /// Appends one AD structure with a `value_len`-byte value written by
+    /// `fill`. Returns `false`, leaving the data untouched, if it does not
+    /// fit.
+    pub(crate) fn push_structure(
+        &mut self,
+        ad_type: u8,
+        value_len: usize,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> bool {
+        let start = self.len();
+        let end = start + 2 + value_len;
+        let (Ok(structure_len), Ok(new_len)) = (u8::try_from(value_len + 1), u8::try_from(end))
+        else {
+            return false;
+        };
+        let Some([len, kind, value @ ..]) = self.bytes.get_mut(start..end) else {
+            return false;
+        };
+        *len = structure_len;
+        *kind = ad_type;
+        fill(value);
+        self.len = new_len;
+        true
+    }
+}
+
+impl Default for AdvData {
+    fn default() -> Self {
+        Self {
+            len: 0,
+            bytes: [0; Self::MAX_LEN],
+        }
+    }
 }
 
 impl AsRef<[u8]> for AdvData {

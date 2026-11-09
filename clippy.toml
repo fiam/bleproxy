@@ -4,4 +4,4 @@ allow-expect-in-tests = true
 allow-panic-in-tests = true
 
 # Product names that are not code identifiers. ".." keeps clippy's defaults.
-doc-valid-idents = ["ESPHome", ".."]
+doc-valid-idents = ["BlueZ", "ESPHome", ".."]

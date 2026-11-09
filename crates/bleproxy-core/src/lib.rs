@@ -8,10 +8,12 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod ad;
 mod address;
 mod advertisement;
 mod uuid;
 
+pub use ad::AdvDataBuilder;
 pub use address::{AddressError, BdAddr};
 pub use advertisement::{AddressType, AdvData, Advertisement, AdvertisementError};
 pub use uuid::{CompactUuid, Uuid, UuidParseError};
