@@ -56,6 +56,10 @@ pub mod message_type {
     pub const UNSUBSCRIBE_BLUETOOTH_LE_ADVERTISEMENTS_REQUEST: u16 = 87;
     /// [`BluetoothLeRawAdvertisementsResponse`](super::BluetoothLeRawAdvertisementsResponse).
     pub const BLUETOOTH_LE_RAW_ADVERTISEMENTS_RESPONSE: u16 = 93;
+    /// [`BluetoothScannerStateResponse`](super::BluetoothScannerStateResponse).
+    pub const BLUETOOTH_SCANNER_STATE_RESPONSE: u16 = 126;
+    /// [`ClientMessage::BluetoothScannerSetMode`](super::ClientMessage::BluetoothScannerSetMode).
+    pub const BLUETOOTH_SCANNER_SET_MODE_REQUEST: u16 = 127;
 }
 
 /// Bluetooth proxy capabilities, reported in
@@ -66,6 +70,34 @@ pub mod bluetooth_proxy_feature {
     /// Forwards advertisements in their raw form (see
     /// [`BluetoothLeRawAdvertisementsResponse`](super::BluetoothLeRawAdvertisementsResponse)).
     pub const RAW_ADVERTISEMENTS: u32 = 1 << 5;
+    /// Reports scanner state (see
+    /// [`BluetoothScannerStateResponse`](super::BluetoothScannerStateResponse))
+    /// and accepts scan mode changes.
+    pub const STATE_AND_MODE: u32 = 1 << 6;
+}
+
+/// Values of the `BluetoothScannerMode` enum.
+pub mod bluetooth_scanner_mode {
+    /// Listen only.
+    pub const PASSIVE: u32 = 0;
+    /// Send scan requests.
+    pub const ACTIVE: u32 = 1;
+}
+
+/// Values of the `BluetoothScannerState` enum.
+pub mod bluetooth_scanner_state {
+    /// Not scanning.
+    pub const IDLE: u32 = 0;
+    /// Starting to scan.
+    pub const STARTING: u32 = 1;
+    /// Scanning.
+    pub const RUNNING: u32 = 2;
+    /// Scanning failed.
+    pub const FAILED: u32 = 3;
+    /// Stopping the scan.
+    pub const STOPPING: u32 = 4;
+    /// The scan stopped.
+    pub const STOPPED: u32 = 5;
 }
 
 /// Flags of [`ClientMessage::SubscribeBluetoothLeAdvertisements`].
@@ -118,6 +150,11 @@ pub enum ClientMessage<'a> {
     UnsubscribeBluetoothLeAdvertisements,
     /// Subscribes to the number of free active connection slots.
     SubscribeBluetoothConnectionsFree,
+    /// Asks the proxy to scan in another mode.
+    BluetoothScannerSetMode {
+        /// One of the [`bluetooth_scanner_mode`] values.
+        mode: u32,
+    },
     /// A message type this crate does not model.
     Unknown(u16),
 }
@@ -181,6 +218,16 @@ impl<'a> ClientMessage<'a> {
             }
             t::SUBSCRIBE_BLUETOOTH_CONNECTIONS_FREE_REQUEST => {
                 Self::SubscribeBluetoothConnectionsFree
+            }
+            t::BLUETOOTH_SCANNER_SET_MODE_REQUEST => {
+                let mut mode = bluetooth_scanner_mode::PASSIVE;
+                for field in Fields::new(payload) {
+                    let field = field?;
+                    if field.number == 1 {
+                        mode = field.as_u32()?;
+                    }
+                }
+                Self::BluetoothScannerSetMode { mode }
             }
             other => Self::Unknown(other),
         })
@@ -378,6 +425,30 @@ impl Message for BluetoothLeRawAdvertisementsResponse<'_> {
     const TYPE: u16 = message_type::BLUETOOTH_LE_RAW_ADVERTISEMENTS_RESPONSE;
 }
 
+/// Reports the scanner's state and mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BluetoothScannerStateResponse {
+    /// One of the [`bluetooth_scanner_state`] values.
+    pub state: u32,
+    /// Current mode, one of the [`bluetooth_scanner_mode`] values.
+    pub mode: u32,
+    /// Mode the proxy was configured with, one of the
+    /// [`bluetooth_scanner_mode`] values.
+    pub configured_mode: u32,
+}
+
+impl Encode for BluetoothScannerStateResponse {
+    fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+        e.uint32(1, self.state)?;
+        e.uint32(2, self.mode)?;
+        e.uint32(3, self.configured_mode)
+    }
+}
+
+impl Message for BluetoothScannerStateResponse {
+    const TYPE: u16 = message_type::BLUETOOTH_SCANNER_STATE_RESPONSE;
+}
+
 #[cfg(test)]
 mod tests {
     //! Expected bytes were produced by the protobuf classes generated from
@@ -505,6 +576,39 @@ mod tests {
         assert_eq!(
             ClientMessage::decode(66, &[]),
             Ok(ClientMessage::SubscribeBluetoothLeAdvertisements { flags: 0 })
+        );
+    }
+
+    #[test]
+    fn encodes_scanner_state() {
+        let running = BluetoothScannerStateResponse {
+            state: bluetooth_scanner_state::RUNNING,
+            mode: bluetooth_scanner_mode::ACTIVE,
+            configured_mode: bluetooth_scanner_mode::PASSIVE,
+        };
+        assert_encodes(&running, "08021001");
+        let stopped = BluetoothScannerStateResponse {
+            state: bluetooth_scanner_state::STOPPED,
+            mode: bluetooth_scanner_mode::PASSIVE,
+            configured_mode: bluetooth_scanner_mode::ACTIVE,
+        };
+        assert_encodes(&stopped, "08051801");
+    }
+
+    #[test]
+    fn decodes_scanner_mode_requests() {
+        assert_eq!(
+            ClientMessage::decode(127, &[0x08, 0x01]),
+            Ok(ClientMessage::BluetoothScannerSetMode {
+                mode: bluetooth_scanner_mode::ACTIVE
+            })
+        );
+        // Passive is the default value, so it is sent as an empty message.
+        assert_eq!(
+            ClientMessage::decode(127, &[]),
+            Ok(ClientMessage::BluetoothScannerSetMode {
+                mode: bluetooth_scanner_mode::PASSIVE
+            })
         );
     }
 

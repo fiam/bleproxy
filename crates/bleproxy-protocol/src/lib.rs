@@ -20,7 +20,8 @@ pub mod wire;
 pub use frame::{FrameError, FrameHeader, MAX_HEADER_LEN, PLAINTEXT_INDICATOR, encode_frame};
 pub use messages::{
     API_VERSION, BluetoothConnectionsFreeResponse, BluetoothLeRawAdvertisementsResponse,
-    ClientMessage, DeviceInfoResponse, DisconnectRequest, DisconnectResponse, HelloRequest,
-    HelloResponse, ListEntitiesDoneResponse, Message, PingRequest, PingResponse, RawAdvertisement,
-    bluetooth_proxy_feature, bluetooth_proxy_subscription, message_type,
+    BluetoothScannerStateResponse, ClientMessage, DeviceInfoResponse, DisconnectRequest,
+    DisconnectResponse, HelloRequest, HelloResponse, ListEntitiesDoneResponse, Message,
+    PingRequest, PingResponse, RawAdvertisement, bluetooth_proxy_feature,
+    bluetooth_proxy_subscription, bluetooth_scanner_mode, bluetooth_scanner_state, message_type,
 };
