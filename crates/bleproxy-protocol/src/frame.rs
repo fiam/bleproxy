@@ -9,7 +9,9 @@
 //! +------+------------------+------------------+-----------------+
 //! ```
 
+use crate::Message;
 use crate::varint;
+use crate::wire::EncodeError;
 
 /// First byte of every plaintext frame.
 pub const PLAINTEXT_INDICATOR: u8 = 0x00;
@@ -116,9 +118,43 @@ impl FrameHeader {
     }
 }
 
+/// Encodes `message` as a complete plaintext frame at the start of `buf`.
+///
+/// Returns the frame length. A buffer of [`MAX_HEADER_LEN`] bytes plus the
+/// message's [`encoded_len`](crate::wire::Encode::encoded_len) is always
+/// large enough.
+///
+/// ```
+/// use bleproxy_protocol::{PingResponse, encode_frame};
+///
+/// let mut buf = [0; 16];
+/// let len = encode_frame(&PingResponse, &mut buf)?;
+/// assert_eq!(&buf[..len], [0x00, 0x00, 0x08]);
+/// # Ok::<(), bleproxy_protocol::wire::EncodeError>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns [`EncodeError::BufferTooSmall`] if `buf` cannot hold the frame.
+pub fn encode_frame<M: Message>(message: &M, buf: &mut [u8]) -> Result<usize, EncodeError> {
+    let header = FrameHeader {
+        payload_len: u32::try_from(message.encoded_len())
+            .map_err(|_| EncodeError::BufferTooSmall)?,
+        message_type: M::TYPE,
+    };
+    let header_len = header
+        .encode(buf)
+        .map_err(|_| EncodeError::BufferTooSmall)?;
+    let payload = buf
+        .get_mut(header_len..)
+        .ok_or(EncodeError::BufferTooSmall)?;
+    Ok(header_len + message.encode_to_slice(payload)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{HelloResponse, PingResponse};
 
     fn encode(header: FrameHeader) -> ([u8; MAX_HEADER_LEN], usize) {
         let mut buf = [0; MAX_HEADER_LEN];
@@ -201,6 +237,33 @@ mod tests {
             FrameHeader::decode(&[0x00, 0x00, 0x80, 0x80, 0x04]),
             Err(FrameError::FieldOverflow)
         );
+    }
+
+    #[test]
+    fn encodes_complete_frames() {
+        let hello = HelloResponse {
+            api_version_major: 1,
+            api_version_minor: 14,
+            server_info: "x",
+            name: "y",
+        };
+        let mut buf = [0; 32];
+        let len = encode_frame(&hello, &mut buf).unwrap();
+        let (header, header_len) = FrameHeader::decode(&buf[..len]).unwrap().unwrap();
+        assert_eq!(header.message_type, 2);
+        assert_eq!(header.payload_len as usize, len - header_len);
+        assert_eq!(
+            &buf[header_len..len],
+            [0x08, 0x01, 0x10, 0x0E, 0x1A, 0x01, b'x', 0x22, 0x01, b'y']
+        );
+
+        for short in 0..len {
+            assert_eq!(
+                encode_frame(&hello, &mut buf[..short]),
+                Err(EncodeError::BufferTooSmall)
+            );
+        }
+        assert_eq!(encode_frame(&PingResponse, &mut buf), Ok(3));
     }
 
     #[test]

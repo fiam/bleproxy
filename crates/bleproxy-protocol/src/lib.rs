@@ -17,7 +17,7 @@ mod messages;
 mod varint;
 pub mod wire;
 
-pub use frame::{FrameError, FrameHeader, MAX_HEADER_LEN, PLAINTEXT_INDICATOR};
+pub use frame::{FrameError, FrameHeader, MAX_HEADER_LEN, PLAINTEXT_INDICATOR, encode_frame};
 pub use messages::{
     API_VERSION, BluetoothConnectionsFreeResponse, BluetoothLeRawAdvertisementsResponse,
     ClientMessage, DeviceInfoResponse, DisconnectRequest, DisconnectResponse, HelloRequest,
