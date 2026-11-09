@@ -12,11 +12,13 @@ import sys
 
 import dbus
 from aioesphomeapi import APIClient
+from aioesphomeapi.model import BluetoothScannerMode, BluetoothScannerState
 
 PORT = 6053
 ADAPTER_ADDRESS = "00:01:02:03:04:05"  # what the mock assigns to hci0
 DEVICE_ADDRESS = "A4:C1:38:00:11:22"
 TIMEOUT = 10
+MODES = {"active": BluetoothScannerMode.ACTIVE, "passive": BluetoothScannerMode.PASSIVE}
 NOBODY = 65534
 
 
@@ -123,11 +125,24 @@ async def main(binary, mode):
         assert info.name == "bleproxy-030405", info
         assert info.project_name == "fiam.bleproxy", info
         flags = info.bluetooth_proxy_feature_flags_compat(client.api_version)
-        assert flags == 0b10_0001, flags
+        # Passive scan, raw advertisements, and state and mode.
+        assert flags == 0b110_0001, flags
 
+        states = []
+        client.subscribe_bluetooth_scanner_state(states.append)
         received = []
         client.subscribe_bluetooth_le_raw_advertisements(
             lambda response: received.extend(response.advertisements)
+        )
+
+        configured = MODES[mode]
+        step("checking the reported scanner state")
+        await wait_for(
+            states,
+            lambda s: s.state == BluetoothScannerState.RUNNING
+            and s.mode == configured
+            and s.configured_mode == configured,
+            "the running scanner",
         )
 
         step("checking that scanning was started")
@@ -174,6 +189,27 @@ async def main(binary, mode):
             update.data.hex()
         )
         assert update.address_type == 0, update
+
+        other = "passive" if mode == "active" else "active"
+        step(f"switching to {other} scanning")
+        client.bluetooth_scanner_set_mode(MODES[other])
+        await wait_for(
+            states,
+            lambda s: s.state == BluetoothScannerState.RUNNING
+            and s.mode == MODES[other]
+            and s.configured_mode == configured,
+            f"the scanner running in {other} mode",
+        )
+        calls = adapter_calls(bus)
+        if other == "passive":
+            assert "StopDiscovery" in calls and "RegisterMonitor" in calls, calls
+        else:
+            assert "UnregisterMonitor" in calls and "StartDiscovery" in calls, calls
+
+        step("receiving advertisements after the switch")
+        second = int("A4C138003344", 16)
+        mock.AddDevice("hci0", "A4:C1:38:00:33:44", "ATC_3344")
+        await wait_for(received, lambda a: a.address == second, "the second device")
 
         await client.disconnect()
     finally:
