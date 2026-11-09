@@ -120,6 +120,7 @@ impl Identity {
             version: Self::VERSION,
             server_info: &self.server_info,
             scanner: self.scanner,
+            encrypted: false,
         }
     }
 }

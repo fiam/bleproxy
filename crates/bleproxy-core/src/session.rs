@@ -8,7 +8,8 @@
 //! [`Outcome::scan_mode`], and the platform reports its scanner's state
 //! with [`Session::scanner_state`].
 
-use bleproxy_protocol::wire::EncodeError;
+use bleproxy_protocol::Message;
+use bleproxy_protocol::wire::{Encode, EncodeError};
 use bleproxy_protocol::{
     API_VERSION, BluetoothConnectionsFreeResponse, BluetoothScannerStateResponse, ClientMessage,
     DeviceInfoResponse, DisconnectResponse, HelloResponse, ListEntitiesDoneResponse, PingResponse,
@@ -43,6 +44,8 @@ pub struct DeviceIdentity<'a> {
     /// clients may change. Without one, scanner state and mode switching
     /// are not offered.
     pub scanner: Option<ScanMode>,
+    /// Whether the API is encrypted.
+    pub encrypted: bool,
 }
 
 impl DeviceIdentity<'_> {
@@ -79,6 +82,38 @@ pub enum Reply<'a> {
 }
 
 impl Reply<'_> {
+    /// Returns the reply's message type identifier.
+    #[must_use]
+    pub const fn message_type(&self) -> u16 {
+        match self {
+            Self::Hello(_) => HelloResponse::TYPE,
+            Self::DeviceInfo(_) => DeviceInfoResponse::TYPE,
+            Self::Ping(_) => PingResponse::TYPE,
+            Self::Disconnect(_) => DisconnectResponse::TYPE,
+            Self::ListEntitiesDone(_) => ListEntitiesDoneResponse::TYPE,
+            Self::ConnectionsFree(_) => BluetoothConnectionsFreeResponse::TYPE,
+            Self::ScannerState(_) => BluetoothScannerStateResponse::TYPE,
+        }
+    }
+
+    /// Encodes just the reply's protobuf payload at the start of `buf`, for
+    /// transports that frame messages themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EncodeError::BufferTooSmall`] if `buf` cannot hold it.
+    pub fn encode_payload(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
+        match self {
+            Self::Hello(message) => message.encode_to_slice(buf),
+            Self::DeviceInfo(message) => message.encode_to_slice(buf),
+            Self::Ping(message) => message.encode_to_slice(buf),
+            Self::Disconnect(message) => message.encode_to_slice(buf),
+            Self::ListEntitiesDone(message) => message.encode_to_slice(buf),
+            Self::ConnectionsFree(message) => message.encode_to_slice(buf),
+            Self::ScannerState(message) => message.encode_to_slice(buf),
+        }
+    }
+
     /// Encodes the reply as a complete frame at the start of `buf`.
     ///
     /// # Errors
@@ -207,7 +242,7 @@ impl<'a> Session<'a> {
                 manufacturer: identity.manufacturer,
                 friendly_name: identity.friendly_name,
                 bluetooth_mac_address: identity.bluetooth_mac_address,
-                api_encryption_supported: false,
+                api_encryption_supported: identity.encrypted,
             })),
             ClientMessage::ListEntities => {
                 Outcome::reply(Reply::ListEntitiesDone(ListEntitiesDoneResponse))
@@ -276,6 +311,7 @@ mod tests {
         version: "0.1.0",
         server_info: "bleproxy 0.1.0",
         scanner: None,
+        encrypted: false,
     };
 
     fn established() -> Session<'static> {
@@ -423,6 +459,34 @@ mod tests {
             established().handle(&ClientMessage::DisconnectResponse),
             Outcome::CLOSE
         );
+    }
+
+    #[test]
+    fn reports_encryption_in_device_info() {
+        let encrypted = DeviceIdentity {
+            encrypted: true,
+            ..IDENTITY
+        };
+        let mut session = Session::new(&encrypted);
+        session.handle(&ClientMessage::Hello(HelloRequest::default()));
+        let Some(Reply::DeviceInfo(info)) = session.handle(&ClientMessage::DeviceInfo).reply else {
+            panic!("expected device info");
+        };
+        assert!(info.api_encryption_supported);
+    }
+
+    #[test]
+    fn encodes_reply_payloads_for_other_transports() {
+        let reply = Reply::ScannerState(BluetoothScannerStateResponse {
+            state: 2,
+            mode: 1,
+            configured_mode: 0,
+        });
+        assert_eq!(reply.message_type(), 126);
+        let mut buf = [0; 16];
+        let len = reply.encode_payload(&mut buf).unwrap();
+        assert_eq!(&buf[..len], [0x08, 0x02, 0x10, 0x01]);
+        assert_eq!(Reply::Ping(PingResponse).message_type(), 8);
     }
 
     #[test]
