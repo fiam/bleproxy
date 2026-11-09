@@ -302,6 +302,8 @@ pub struct DeviceInfoResponse<'a> {
     pub friendly_name: &'a str,
     /// MAC address of the Bluetooth adapter (`AA:BB:CC:DD:EE:FF`).
     pub bluetooth_mac_address: &'a str,
+    /// Whether the API is encrypted (see [`crate::noise`]).
+    pub api_encryption_supported: bool,
 }
 
 impl Encode for DeviceInfoResponse<'_> {
@@ -315,7 +317,8 @@ impl Encode for DeviceInfoResponse<'_> {
         e.string(12, self.manufacturer)?;
         e.string(13, self.friendly_name)?;
         e.uint32(15, self.bluetooth_proxy_feature_flags)?;
-        e.string(18, self.bluetooth_mac_address)
+        e.string(18, self.bluetooth_mac_address)?;
+        e.bool(19, self.api_encryption_supported)
     }
 }
 
@@ -520,6 +523,7 @@ mod tests {
             manufacturer: "bleproxy",
             friendly_name: "Bluetooth Proxy",
             bluetooth_mac_address: "AA:BB:CC:A1:B2:C3",
+            api_encryption_supported: false,
         };
         assert_encodes(
             &response,
@@ -530,6 +534,17 @@ mod tests {
                 "6f7879782192011141413a42423a43433a41313a42323a4333",
             ),
         );
+    }
+
+    #[test]
+    fn encodes_encryption_support() {
+        let response = DeviceInfoResponse {
+            name: "x",
+            bluetooth_mac_address: "y",
+            api_encryption_supported: true,
+            ..DeviceInfoResponse::default()
+        };
+        assert_encodes(&response, "12017892010179980101");
     }
 
     #[test]

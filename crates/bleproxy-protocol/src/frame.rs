@@ -19,15 +19,23 @@ pub const PLAINTEXT_INDICATOR: u8 = 0x00;
 /// Longest possible encoded frame header, in bytes.
 pub const MAX_HEADER_LEN: usize = 1 + varint::MAX_U32_LEN + 3;
 
-/// Errors produced while encoding or decoding frame headers.
+/// Errors produced while encoding or decoding frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum FrameError {
-    /// The frame does not start with [`PLAINTEXT_INDICATOR`].
-    ///
-    /// Noise-encrypted connections start with `0x01`.
-    #[error("unsupported frame indicator {0:#04x}, expected a plaintext frame")]
+    /// The frame starts with the indicator of the other framing: `0x00`
+    /// ([`PLAINTEXT_INDICATOR`]) for plaintext, `0x01`
+    /// ([`NOISE_INDICATOR`](crate::noise::NOISE_INDICATOR)) for encrypted
+    /// connections, or something else entirely.
+    #[error("unexpected frame indicator {0:#04x}")]
     UnsupportedIndicator(u8),
+    /// A frame payload is too long for its length field.
+    #[error("frame payload of {0} bytes is too large")]
+    PayloadTooLarge(usize),
+    /// A decrypted data frame is shorter than its header or its length
+    /// doesn't match.
+    #[error("malformed encrypted data frame")]
+    MalformedDataFrame,
     /// A header field is wider than its type allows.
     #[error("frame header field is out of range")]
     FieldOverflow,

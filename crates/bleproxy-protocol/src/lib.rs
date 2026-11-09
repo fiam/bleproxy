@@ -14,6 +14,7 @@
 
 mod frame;
 mod messages;
+pub mod noise;
 mod varint;
 pub mod wire;
 

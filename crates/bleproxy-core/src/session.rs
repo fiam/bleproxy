@@ -207,6 +207,7 @@ impl<'a> Session<'a> {
                 manufacturer: identity.manufacturer,
                 friendly_name: identity.friendly_name,
                 bluetooth_mac_address: identity.bluetooth_mac_address,
+                api_encryption_supported: false,
             })),
             ClientMessage::ListEntities => {
                 Outcome::reply(Reply::ListEntitiesDone(ListEntitiesDoneResponse))
