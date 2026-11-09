@@ -173,3 +173,20 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - run: docker run --rm bleproxy:ci --version
+
+  # Publish ghcr.io/<owner>/bleproxy:edge for testing unreleased changes,
+  # once every check on main has passed.
+  edge:
+    name: Edge image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [fmt, lint, test, msrv, e2e, docs, deny, deps, esp32c3, esp32s3, image]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/image.yml
+    with:
+      tags: |
+        type=edge,branch=main
+        type=sha
