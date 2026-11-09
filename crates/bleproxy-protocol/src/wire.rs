@@ -158,6 +158,31 @@ impl<S: Sink> Encoder<S> {
         self.varint(value)
     }
 
+    /// Writes an `int32` field. Negative values take ten bytes, since they
+    /// are sign-extended to 64 bits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sink is full.
+    pub fn int32(&mut self, field: u32, value: i32) -> Result<(), EncodeError> {
+        self.uint64(field, i64::from(value).cast_unsigned())
+    }
+
+    /// Writes a `repeated uint64` field, packed as proto3 does by default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sink is full.
+    pub fn packed_uint64(&mut self, field: u32, values: &[u64]) -> Result<(), EncodeError> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        let len: usize = values.iter().map(|value| varint::encode(*value).1).sum();
+        self.key(field, WireType::Len)?;
+        self.varint(len as u64)?;
+        values.iter().try_for_each(|value| self.varint(*value))
+    }
+
     /// Writes a `sint32` field (zigzag encoded).
     ///
     /// # Errors
@@ -542,6 +567,25 @@ mod tests {
                 Err(EncodeError::BufferTooSmall)
             );
         }
+    }
+
+    #[test]
+    fn encodes_negative_int32_and_packed_fields() {
+        let mut buf = [0; 32];
+        let mut e = Encoder::new(SliceSink::new(&mut buf));
+        e.int32(1, -1).unwrap();
+        e.int32(2, 5).unwrap();
+        e.packed_uint64(3, &[1, 300]).unwrap();
+        e.packed_uint64(4, &[]).unwrap();
+        let len = e.into_sink().len();
+        assert_eq!(
+            &buf[..len],
+            [
+                0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, // 1: -1
+                0x10, 0x05, // 2: 5
+                0x1A, 0x03, 0x01, 0xAC, 0x02, // 3: [1, 300]
+            ]
+        );
     }
 
     #[test]

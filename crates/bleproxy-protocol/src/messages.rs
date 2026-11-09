@@ -1,17 +1,17 @@
-//! ESPHome Native API messages used by a passive Bluetooth proxy.
+//! ESPHome Native API messages used by a Bluetooth proxy.
 //!
 //! Field numbers and message type identifiers follow ESPHome's `api.proto`.
-//! Only the messages a passive proxy exchanges are modeled; any other
+//! Only the messages a Bluetooth proxy exchanges are modeled; any other
 //! client message decodes as [`ClientMessage::Unknown`].
 
-use crate::wire::{DecodeError, Encode, EncodeError, Encoder, Fields, Sink};
+use crate::wire::{DecodeError, Encode, EncodeError, Encoder, Field, Fields, Sink};
 
 /// API version reported to clients.
 ///
 /// 1.14 is the newest version for which clients still derive the device's
 /// capabilities (Bluetooth proxy feature flags and MAC address) from
 /// [`DeviceInfoResponse`]; from 1.15 on they expect a separate capabilities
-/// request. Everything a passive proxy uses predates it.
+/// request. Everything a proxy uses predates it.
 pub const API_VERSION: (u32, u32) = (1, 14);
 
 /// Message type identifiers sent in frame headers.
@@ -48,10 +48,40 @@ pub mod message_type {
     pub const SUBSCRIBE_HOME_ASSISTANT_STATES_REQUEST: u16 = 38;
     /// [`ClientMessage::SubscribeBluetoothLeAdvertisements`](super::ClientMessage::SubscribeBluetoothLeAdvertisements).
     pub const SUBSCRIBE_BLUETOOTH_LE_ADVERTISEMENTS_REQUEST: u16 = 66;
+    /// [`ClientMessage::BluetoothDeviceRequest`](super::ClientMessage::BluetoothDeviceRequest).
+    pub const BLUETOOTH_DEVICE_REQUEST: u16 = 68;
+    /// [`BluetoothDeviceConnectionResponse`](super::BluetoothDeviceConnectionResponse).
+    pub const BLUETOOTH_DEVICE_CONNECTION_RESPONSE: u16 = 69;
+    /// [`ClientMessage::BluetoothGattGetServices`](super::ClientMessage::BluetoothGattGetServices).
+    pub const BLUETOOTH_GATT_GET_SERVICES_REQUEST: u16 = 70;
+    /// [`BluetoothGattGetServicesResponse`](super::BluetoothGattGetServicesResponse).
+    pub const BLUETOOTH_GATT_GET_SERVICES_RESPONSE: u16 = 71;
+    /// [`BluetoothGattGetServicesDoneResponse`](super::BluetoothGattGetServicesDoneResponse).
+    pub const BLUETOOTH_GATT_GET_SERVICES_DONE_RESPONSE: u16 = 72;
+    /// [`ClientMessage::BluetoothGattRead`](super::ClientMessage::BluetoothGattRead).
+    pub const BLUETOOTH_GATT_READ_REQUEST: u16 = 73;
+    /// [`BluetoothGattReadResponse`](super::BluetoothGattReadResponse).
+    pub const BLUETOOTH_GATT_READ_RESPONSE: u16 = 74;
+    /// [`ClientMessage::BluetoothGattWrite`](super::ClientMessage::BluetoothGattWrite).
+    pub const BLUETOOTH_GATT_WRITE_REQUEST: u16 = 75;
+    /// [`ClientMessage::BluetoothGattReadDescriptor`](super::ClientMessage::BluetoothGattReadDescriptor).
+    pub const BLUETOOTH_GATT_READ_DESCRIPTOR_REQUEST: u16 = 76;
+    /// [`ClientMessage::BluetoothGattWriteDescriptor`](super::ClientMessage::BluetoothGattWriteDescriptor).
+    pub const BLUETOOTH_GATT_WRITE_DESCRIPTOR_REQUEST: u16 = 77;
+    /// [`ClientMessage::BluetoothGattNotify`](super::ClientMessage::BluetoothGattNotify).
+    pub const BLUETOOTH_GATT_NOTIFY_REQUEST: u16 = 78;
+    /// [`BluetoothGattNotifyDataResponse`](super::BluetoothGattNotifyDataResponse).
+    pub const BLUETOOTH_GATT_NOTIFY_DATA_RESPONSE: u16 = 79;
     /// [`ClientMessage::SubscribeBluetoothConnectionsFree`](super::ClientMessage::SubscribeBluetoothConnectionsFree).
     pub const SUBSCRIBE_BLUETOOTH_CONNECTIONS_FREE_REQUEST: u16 = 80;
     /// [`BluetoothConnectionsFreeResponse`](super::BluetoothConnectionsFreeResponse).
     pub const BLUETOOTH_CONNECTIONS_FREE_RESPONSE: u16 = 81;
+    /// [`BluetoothGattErrorResponse`](super::BluetoothGattErrorResponse).
+    pub const BLUETOOTH_GATT_ERROR_RESPONSE: u16 = 82;
+    /// [`BluetoothGattWriteResponse`](super::BluetoothGattWriteResponse).
+    pub const BLUETOOTH_GATT_WRITE_RESPONSE: u16 = 83;
+    /// [`BluetoothGattNotifyResponse`](super::BluetoothGattNotifyResponse).
+    pub const BLUETOOTH_GATT_NOTIFY_RESPONSE: u16 = 84;
     /// [`ClientMessage::UnsubscribeBluetoothLeAdvertisements`](super::ClientMessage::UnsubscribeBluetoothLeAdvertisements).
     pub const UNSUBSCRIBE_BLUETOOTH_LE_ADVERTISEMENTS_REQUEST: u16 = 87;
     /// [`BluetoothLeRawAdvertisementsResponse`](super::BluetoothLeRawAdvertisementsResponse).
@@ -67,6 +97,12 @@ pub mod message_type {
 pub mod bluetooth_proxy_feature {
     /// Forwards advertisements received while scanning.
     pub const PASSIVE_SCAN: u32 = 1 << 0;
+    /// Connects to devices and proxies their GATT services.
+    pub const ACTIVE_CONNECTIONS: u32 = 1 << 1;
+    /// Lets clients cache GATT services and handle the client
+    /// characteristic configuration descriptor themselves (version 3
+    /// connections). Current clients require it for active connections.
+    pub const REMOTE_CACHING: u32 = 1 << 2;
     /// Forwards advertisements in their raw form (see
     /// [`BluetoothLeRawAdvertisementsResponse`](super::BluetoothLeRawAdvertisementsResponse)).
     pub const RAW_ADVERTISEMENTS: u32 = 1 << 5;
@@ -98,6 +134,53 @@ pub mod bluetooth_scanner_state {
     pub const STOPPING: u32 = 4;
     /// The scan stopped.
     pub const STOPPED: u32 = 5;
+}
+
+/// Values of the `BluetoothDeviceRequestType` enum, carried by
+/// [`BluetoothDeviceRequest::request_type`].
+pub mod bluetooth_device_request_type {
+    /// Connect (version 1); no longer used by clients.
+    pub const CONNECT: u32 = 0;
+    /// Disconnect, or cancel a pending connection.
+    pub const DISCONNECT: u32 = 1;
+    /// Pair with the device.
+    pub const PAIR: u32 = 2;
+    /// Remove the pairing.
+    pub const UNPAIR: u32 = 3;
+    /// Connect (version 3); the client has the device's services cached.
+    pub const CONNECT_V3_WITH_CACHE: u32 = 4;
+    /// Connect (version 3); the client will ask for the services.
+    pub const CONNECT_V3_WITHOUT_CACHE: u32 = 5;
+    /// Clear the proxy's cache of the device's services.
+    pub const CLEAR_CACHE: u32 = 6;
+}
+
+/// Error codes of connection and GATT responses, as ESPHome reports them
+/// (ESP-IDF's GATT status and connection reason codes). Clients turn them
+/// into messages.
+pub mod bluetooth_error {
+    /// The device is not connected (an ESPHome extension).
+    pub const NOT_CONNECTED: i32 = -1;
+    /// No attribute has the handle.
+    pub const INVALID_HANDLE: i32 = 0x01;
+    /// The attribute cannot be read.
+    pub const READ_NOT_PERMITTED: i32 = 0x02;
+    /// The attribute cannot be written.
+    pub const WRITE_NOT_PERMITTED: i32 = 0x03;
+    /// The device requires pairing.
+    pub const INSUFFICIENT_AUTHENTICATION: i32 = 0x05;
+    /// The device doesn't support the request.
+    pub const REQUEST_NOT_SUPPORTED: i32 = 0x06;
+    /// The offset is past the end of the value.
+    pub const INVALID_OFFSET: i32 = 0x07;
+    /// The device requires authorization.
+    pub const INSUFFICIENT_AUTHORIZATION: i32 = 0x08;
+    /// The value has the wrong length.
+    pub const INVALID_ATTRIBUTE_LENGTH: i32 = 0x0D;
+    /// The connection could not be established.
+    pub const CONNECTION_FAILED: i32 = 0x3E;
+    /// Any other failure.
+    pub const ERROR: i32 = 0x85;
 }
 
 /// Flags of [`ClientMessage::SubscribeBluetoothLeAdvertisements`].
@@ -150,6 +233,57 @@ pub enum ClientMessage<'a> {
     UnsubscribeBluetoothLeAdvertisements,
     /// Subscribes to the number of free active connection slots.
     SubscribeBluetoothConnectionsFree,
+    /// Connects to, disconnects from or pairs with a device.
+    BluetoothDeviceRequest(BluetoothDeviceRequest),
+    /// Asks for a connected device's GATT services.
+    BluetoothGattGetServices {
+        /// Device address as a 48-bit integer.
+        address: u64,
+    },
+    /// Reads a characteristic.
+    BluetoothGattRead {
+        /// Device address as a 48-bit integer.
+        address: u64,
+        /// Characteristic handle.
+        handle: u32,
+    },
+    /// Writes a characteristic.
+    BluetoothGattWrite {
+        /// Device address as a 48-bit integer.
+        address: u64,
+        /// Characteristic handle.
+        handle: u32,
+        /// Whether to write with a response (a write request rather than a
+        /// write command), and confirm with [`BluetoothGattWriteResponse`].
+        response: bool,
+        /// Value to write.
+        data: &'a [u8],
+    },
+    /// Reads a descriptor.
+    BluetoothGattReadDescriptor {
+        /// Device address as a 48-bit integer.
+        address: u64,
+        /// Descriptor handle.
+        handle: u32,
+    },
+    /// Writes a descriptor.
+    BluetoothGattWriteDescriptor {
+        /// Device address as a 48-bit integer.
+        address: u64,
+        /// Descriptor handle.
+        handle: u32,
+        /// Value to write.
+        data: &'a [u8],
+    },
+    /// Starts or stops forwarding a characteristic's notifications.
+    BluetoothGattNotify {
+        /// Device address as a 48-bit integer.
+        address: u64,
+        /// Characteristic handle.
+        handle: u32,
+        /// Whether to start (or stop) forwarding.
+        enable: bool,
+    },
     /// Asks the proxy to scan in another mode.
     BluetoothScannerSetMode {
         /// One of the [`bluetooth_scanner_mode`] values.
@@ -157,6 +291,17 @@ pub enum ClientMessage<'a> {
     },
     /// A message type this crate does not model.
     Unknown(u16),
+}
+
+/// Asks the proxy to connect to, disconnect from or pair with a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BluetoothDeviceRequest {
+    /// Device address as a 48-bit integer.
+    pub address: u64,
+    /// One of the [`bluetooth_device_request_type`] values.
+    pub request_type: u32,
+    /// Address type (0 public, 1 random), if the client knows it.
+    pub address_type: Option<u32>,
 }
 
 /// The first message of every session.
@@ -219,6 +364,13 @@ impl<'a> ClientMessage<'a> {
             t::SUBSCRIBE_BLUETOOTH_CONNECTIONS_FREE_REQUEST => {
                 Self::SubscribeBluetoothConnectionsFree
             }
+            t::BLUETOOTH_DEVICE_REQUEST => {
+                Self::BluetoothDeviceRequest(BluetoothDeviceRequest::decode(payload)?)
+            }
+            // The GATT requests, and the responses in between.
+            t::BLUETOOTH_GATT_GET_SERVICES_REQUEST..=t::BLUETOOTH_GATT_NOTIFY_REQUEST => {
+                Self::decode_gatt_request(type_id, payload)?
+            }
             t::BLUETOOTH_SCANNER_SET_MODE_REQUEST => {
                 let mut mode = bluetooth_scanner_mode::PASSIVE;
                 for field in Fields::new(payload) {
@@ -231,6 +383,109 @@ impl<'a> ClientMessage<'a> {
             }
             other => Self::Unknown(other),
         })
+    }
+}
+
+impl<'a> ClientMessage<'a> {
+    fn decode_gatt_request(type_id: u16, payload: &'a [u8]) -> Result<Self, DecodeError> {
+        use message_type as t;
+        Ok(match type_id {
+            t::BLUETOOTH_GATT_GET_SERVICES_REQUEST => {
+                let (address, _) = decode_gatt(payload, |_| Ok(()))?;
+                Self::BluetoothGattGetServices { address }
+            }
+            t::BLUETOOTH_GATT_READ_REQUEST => {
+                let (address, handle) = decode_gatt(payload, |_| Ok(()))?;
+                Self::BluetoothGattRead { address, handle }
+            }
+            t::BLUETOOTH_GATT_WRITE_REQUEST => {
+                let (mut response, mut data) = (false, &[][..]);
+                let (address, handle) = decode_gatt(payload, |field| {
+                    match field.number {
+                        3 => response = field.as_bool()?,
+                        4 => data = field.as_bytes()?,
+                        _ => {}
+                    }
+                    Ok(())
+                })?;
+                Self::BluetoothGattWrite {
+                    address,
+                    handle,
+                    response,
+                    data,
+                }
+            }
+            t::BLUETOOTH_GATT_READ_DESCRIPTOR_REQUEST => {
+                let (address, handle) = decode_gatt(payload, |_| Ok(()))?;
+                Self::BluetoothGattReadDescriptor { address, handle }
+            }
+            t::BLUETOOTH_GATT_WRITE_DESCRIPTOR_REQUEST => {
+                let mut data = &[][..];
+                let (address, handle) = decode_gatt(payload, |field| {
+                    if field.number == 3 {
+                        data = field.as_bytes()?;
+                    }
+                    Ok(())
+                })?;
+                Self::BluetoothGattWriteDescriptor {
+                    address,
+                    handle,
+                    data,
+                }
+            }
+            t::BLUETOOTH_GATT_NOTIFY_REQUEST => {
+                let mut enable = false;
+                let (address, handle) = decode_gatt(payload, |field| {
+                    if field.number == 3 {
+                        enable = field.as_bool()?;
+                    }
+                    Ok(())
+                })?;
+                Self::BluetoothGattNotify {
+                    address,
+                    handle,
+                    enable,
+                }
+            }
+            other => Self::Unknown(other),
+        })
+    }
+}
+
+/// Decodes a GATT request: an address (field 1) and a handle (field 2),
+/// with any other field passed to `other`.
+fn decode_gatt<'a>(
+    payload: &'a [u8],
+    mut other: impl FnMut(Field<'a>) -> Result<(), DecodeError>,
+) -> Result<(u64, u32), DecodeError> {
+    let (mut address, mut handle) = (0, 0);
+    for field in Fields::new(payload) {
+        let field = field?;
+        match field.number {
+            1 => address = field.as_u64()?,
+            2 => handle = field.as_u32()?,
+            _ => other(field)?,
+        }
+    }
+    Ok((address, handle))
+}
+
+impl BluetoothDeviceRequest {
+    fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        let mut request = Self::default();
+        let (mut has_address_type, mut address_type) = (false, 0);
+        for field in Fields::new(payload) {
+            let field = field?;
+            match field.number {
+                1 => request.address = field.as_u64()?,
+                2 => request.request_type = field.as_u32()?,
+                3 => has_address_type = field.as_bool()?,
+                4 => address_type = field.as_u32()?,
+                _ => {}
+            }
+        }
+        request.address_type = has_address_type.then_some(address_type);
+        Ok(request)
     }
 }
 
@@ -368,21 +623,24 @@ empty_message!(
 
 /// Reports free active connection slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct BluetoothConnectionsFreeResponse {
+pub struct BluetoothConnectionsFreeResponse<'a> {
     /// Free connection slots.
     pub free: u32,
     /// Total connection slots.
     pub limit: u32,
+    /// Addresses of the devices holding the other slots.
+    pub allocated: &'a [u64],
 }
 
-impl Encode for BluetoothConnectionsFreeResponse {
+impl Encode for BluetoothConnectionsFreeResponse<'_> {
     fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
         e.uint32(1, self.free)?;
-        e.uint32(2, self.limit)
+        e.uint32(2, self.limit)?;
+        e.packed_uint64(3, self.allocated)
     }
 }
 
-impl Message for BluetoothConnectionsFreeResponse {
+impl Message for BluetoothConnectionsFreeResponse<'_> {
     const TYPE: u16 = message_type::BLUETOOTH_CONNECTIONS_FREE_RESPONSE;
 }
 
@@ -450,6 +708,246 @@ impl Encode for BluetoothScannerStateResponse {
 
 impl Message for BluetoothScannerStateResponse {
     const TYPE: u16 = message_type::BLUETOOTH_SCANNER_STATE_RESPONSE;
+}
+
+/// Reports a device's connection state: answers connection and
+/// disconnection requests, and announces disconnections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BluetoothDeviceConnectionResponse {
+    /// Device address as a 48-bit integer.
+    pub address: u64,
+    /// Whether the device is connected (with its services resolved).
+    pub connected: bool,
+    /// ATT MTU of the connection.
+    pub mtu: u32,
+    /// Why connecting failed or the connection ended, one of the
+    /// [`bluetooth_error`] values, or 0.
+    pub error: i32,
+}
+
+impl Encode for BluetoothDeviceConnectionResponse {
+    fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+        e.uint64(1, self.address)?;
+        e.bool(2, self.connected)?;
+        e.uint32(3, self.mtu)?;
+        e.int32(4, self.error)
+    }
+}
+
+impl Message for BluetoothDeviceConnectionResponse {
+    const TYPE: u16 = message_type::BLUETOOTH_DEVICE_CONNECTION_RESPONSE;
+}
+
+/// Writes a 128-bit UUID as the pair of `uint64` ESPHome uses: the high
+/// half, then the low half.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "splits the UUID into its halves"
+)]
+fn encode_uuid<S: Sink>(e: &mut Encoder<S>, field: u32, uuid: u128) -> Result<(), EncodeError> {
+    e.packed_uint64(field, &[(uuid >> 64) as u64, uuid as u64])
+}
+
+/// A GATT descriptor in a [`BluetoothGattGetServicesResponse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BluetoothGattDescriptor {
+    /// Descriptor UUID.
+    pub uuid: u128,
+    /// Descriptor handle.
+    pub handle: u32,
+}
+
+impl Encode for BluetoothGattDescriptor {
+    fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+        encode_uuid(e, 1, self.uuid)?;
+        e.uint32(2, self.handle)
+    }
+}
+
+/// A GATT characteristic in a [`BluetoothGattGetServicesResponse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BluetoothGattCharacteristic<'a> {
+    /// Characteristic UUID.
+    pub uuid: u128,
+    /// Handle of the characteristic's value.
+    pub handle: u32,
+    /// Characteristic properties (read, write, notify...) as the GATT
+    /// bit mask.
+    pub properties: u32,
+    /// The characteristic's descriptors.
+    pub descriptors: &'a [BluetoothGattDescriptor],
+}
+
+impl Encode for BluetoothGattCharacteristic<'_> {
+    fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+        encode_uuid(e, 1, self.uuid)?;
+        e.uint32(2, self.handle)?;
+        e.uint32(3, self.properties)?;
+        for descriptor in self.descriptors {
+            e.message(4, descriptor)?;
+        }
+        Ok(())
+    }
+}
+
+/// A GATT service in a [`BluetoothGattGetServicesResponse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BluetoothGattService<'a> {
+    /// Service UUID.
+    pub uuid: u128,
+    /// Handle of the service declaration.
+    pub handle: u32,
+    /// The service's characteristics.
+    pub characteristics: &'a [BluetoothGattCharacteristic<'a>],
+}
+
+impl Encode for BluetoothGattService<'_> {
+    fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+        encode_uuid(e, 1, self.uuid)?;
+        e.uint32(2, self.handle)?;
+        for characteristic in self.characteristics {
+            e.message(3, characteristic)?;
+        }
+        Ok(())
+    }
+}
+
+/// Some of a device's GATT services; answers
+/// [`ClientMessage::BluetoothGattGetServices`] together with more of these
+/// and a final [`BluetoothGattGetServicesDoneResponse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BluetoothGattGetServicesResponse<'a> {
+    /// Device address as a 48-bit integer.
+    pub address: u64,
+    /// The services.
+    pub services: &'a [BluetoothGattService<'a>],
+}
+
+impl Encode for BluetoothGattGetServicesResponse<'_> {
+    fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+        e.uint64(1, self.address)?;
+        for service in self.services {
+            e.message(2, service)?;
+        }
+        Ok(())
+    }
+}
+
+impl Message for BluetoothGattGetServicesResponse<'_> {
+    const TYPE: u16 = message_type::BLUETOOTH_GATT_GET_SERVICES_RESPONSE;
+}
+
+/// Ends the answer to [`ClientMessage::BluetoothGattGetServices`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BluetoothGattGetServicesDoneResponse {
+    /// Device address as a 48-bit integer.
+    pub address: u64,
+}
+
+impl Encode for BluetoothGattGetServicesDoneResponse {
+    fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+        e.uint64(1, self.address)
+    }
+}
+
+impl Message for BluetoothGattGetServicesDoneResponse {
+    const TYPE: u16 = message_type::BLUETOOTH_GATT_GET_SERVICES_DONE_RESPONSE;
+}
+
+/// Declares a message that carries an attribute's value.
+macro_rules! gatt_data_message {
+    ($(#[$doc:meta])* $name:ident = $type:expr) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+        pub struct $name<'a> {
+            /// Device address as a 48-bit integer.
+            pub address: u64,
+            /// Attribute handle.
+            pub handle: u32,
+            /// The value.
+            pub data: &'a [u8],
+        }
+
+        impl Encode for $name<'_> {
+            fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+                e.uint64(1, self.address)?;
+                e.uint32(2, self.handle)?;
+                e.bytes(3, self.data)
+            }
+        }
+
+        impl Message for $name<'_> {
+            const TYPE: u16 = $type;
+        }
+    };
+}
+
+gatt_data_message!(
+    /// Answers [`ClientMessage::BluetoothGattRead`] and
+    /// [`ClientMessage::BluetoothGattReadDescriptor`].
+    BluetoothGattReadResponse = message_type::BLUETOOTH_GATT_READ_RESPONSE
+);
+gatt_data_message!(
+    /// Forwards a notification or indication.
+    BluetoothGattNotifyDataResponse = message_type::BLUETOOTH_GATT_NOTIFY_DATA_RESPONSE
+);
+
+/// Declares a message that acknowledges an operation on an attribute.
+macro_rules! gatt_ack_message {
+    ($(#[$doc:meta])* $name:ident = $type:expr) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+        pub struct $name {
+            /// Device address as a 48-bit integer.
+            pub address: u64,
+            /// Attribute handle.
+            pub handle: u32,
+        }
+
+        impl Encode for $name {
+            fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+                e.uint64(1, self.address)?;
+                e.uint32(2, self.handle)
+            }
+        }
+
+        impl Message for $name {
+            const TYPE: u16 = $type;
+        }
+    };
+}
+
+gatt_ack_message!(
+    /// Confirms a [`ClientMessage::BluetoothGattWrite`] that asked for a
+    /// response, or a [`ClientMessage::BluetoothGattWriteDescriptor`].
+    BluetoothGattWriteResponse = message_type::BLUETOOTH_GATT_WRITE_RESPONSE
+);
+gatt_ack_message!(
+    /// Confirms a [`ClientMessage::BluetoothGattNotify`].
+    BluetoothGattNotifyResponse = message_type::BLUETOOTH_GATT_NOTIFY_RESPONSE
+);
+
+/// Reports a failed GATT operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BluetoothGattErrorResponse {
+    /// Device address as a 48-bit integer.
+    pub address: u64,
+    /// Handle of the attribute the operation was for.
+    pub handle: u32,
+    /// One of the [`bluetooth_error`] values.
+    pub error: i32,
+}
+
+impl Encode for BluetoothGattErrorResponse {
+    fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+        e.uint64(1, self.address)?;
+        e.uint32(2, self.handle)?;
+        e.int32(3, self.error)
+    }
+}
+
+impl Message for BluetoothGattErrorResponse {
+    const TYPE: u16 = message_type::BLUETOOTH_GATT_ERROR_RESPONSE;
 }
 
 #[cfg(test)]
@@ -641,11 +1139,208 @@ mod tests {
             (38, ClientMessage::SubscribeHomeAssistantStates),
             (80, ClientMessage::SubscribeBluetoothConnectionsFree),
             (87, ClientMessage::UnsubscribeBluetoothLeAdvertisements),
+            // Server messages among the GATT requests.
+            (71, ClientMessage::Unknown(71)),
             (150, ClientMessage::Unknown(150)),
         ];
         for (message_type, expected) in cases {
             assert_eq!(ClientMessage::decode(message_type, &[]), Ok(expected));
         }
+    }
+
+    const ADDRESS: u64 = 0xA4C1_3800_1122;
+
+    fn assert_decodes(message_type: u16, payload_hex: &str, expected: ClientMessage<'_>) {
+        let (payload, len) = hex(payload_hex);
+        assert_eq!(
+            ClientMessage::decode(message_type, &payload[..len]),
+            Ok(expected),
+            "message type {message_type}"
+        );
+    }
+
+    #[test]
+    fn decodes_device_requests() {
+        assert_decodes(
+            68,
+            "08a2a280c0939829100418012001",
+            ClientMessage::BluetoothDeviceRequest(BluetoothDeviceRequest {
+                address: ADDRESS,
+                request_type: bluetooth_device_request_type::CONNECT_V3_WITH_CACHE,
+                address_type: Some(1),
+            }),
+        );
+        // Disconnect requests don't carry an address type.
+        assert_decodes(
+            68,
+            "08a2a280c09398291001",
+            ClientMessage::BluetoothDeviceRequest(BluetoothDeviceRequest {
+                address: ADDRESS,
+                request_type: bluetooth_device_request_type::DISCONNECT,
+                address_type: None,
+            }),
+        );
+    }
+
+    #[test]
+    fn decodes_gatt_requests() {
+        let cases = [
+            (
+                70,
+                "08a2a280c0939829",
+                ClientMessage::BluetoothGattGetServices { address: ADDRESS },
+            ),
+            (
+                73,
+                "08a2a280c0939829102a",
+                ClientMessage::BluetoothGattRead {
+                    address: ADDRESS,
+                    handle: 0x2A,
+                },
+            ),
+            (
+                75,
+                "08a2a280c0939829102a180122020102",
+                ClientMessage::BluetoothGattWrite {
+                    address: ADDRESS,
+                    handle: 0x2A,
+                    response: true,
+                    data: &[0x01, 0x02],
+                },
+            ),
+            (
+                76,
+                "08a2a280c0939829102c",
+                ClientMessage::BluetoothGattReadDescriptor {
+                    address: ADDRESS,
+                    handle: 0x2C,
+                },
+            ),
+            (
+                77,
+                "08a2a280c0939829102c1a020100",
+                ClientMessage::BluetoothGattWriteDescriptor {
+                    address: ADDRESS,
+                    handle: 0x2C,
+                    data: &[0x01, 0x00],
+                },
+            ),
+            (
+                78,
+                "08a2a280c0939829102a1801",
+                ClientMessage::BluetoothGattNotify {
+                    address: ADDRESS,
+                    handle: 0x2A,
+                    enable: true,
+                },
+            ),
+        ];
+        for (message_type, payload, expected) in cases {
+            assert_decodes(message_type, payload, expected);
+        }
+    }
+
+    #[test]
+    fn encodes_connection_responses() {
+        let connected = BluetoothDeviceConnectionResponse {
+            address: ADDRESS,
+            connected: true,
+            mtu: 247,
+            error: 0,
+        };
+        assert_encodes(&connected, "08a2a280c0939829100118f701");
+        let not_connected = BluetoothDeviceConnectionResponse {
+            address: ADDRESS,
+            error: bluetooth_error::NOT_CONNECTED,
+            ..BluetoothDeviceConnectionResponse::default()
+        };
+        assert_encodes(&not_connected, "08a2a280c093982920ffffffffffffffffff01");
+        let failed = BluetoothDeviceConnectionResponse {
+            address: ADDRESS,
+            error: bluetooth_error::CONNECTION_FAILED,
+            ..BluetoothDeviceConnectionResponse::default()
+        };
+        assert_encodes(&failed, "08a2a280c0939829203e");
+    }
+
+    #[test]
+    fn encodes_services() {
+        let descriptors = [BluetoothGattDescriptor {
+            uuid: 0x0000_2902_0000_1000_8000_0080_5F9B_34FB,
+            handle: 0x2B,
+        }];
+        let characteristics = [BluetoothGattCharacteristic {
+            uuid: 0x0000_2A19_0000_1000_8000_0080_5F9B_34FB,
+            handle: 0x2A,
+            properties: 0x12,
+            descriptors: &descriptors,
+        }];
+        let services = [BluetoothGattService {
+            uuid: 0x0000_180F_0000_1000_8000_0080_5F9B_34FB,
+            handle: 0x28,
+            characteristics: &characteristics,
+        }];
+        let response = BluetoothGattGetServicesResponse {
+            address: ADDRESS,
+            services: &services,
+        };
+        assert_encodes(
+            &response,
+            concat!(
+                "08a2a280c093982912450a1180a08080f08106fbe9ecfc85908080800110281a",
+                "2e0a1180a0808090c30afbe9ecfc859080808001102a181222150a1180a08080",
+                "a0a00afbe9ecfc859080808001102b",
+            ),
+        );
+        let done = BluetoothGattGetServicesDoneResponse { address: ADDRESS };
+        assert_encodes(&done, "08a2a280c0939829");
+    }
+
+    #[test]
+    fn encodes_gatt_responses() {
+        let read = BluetoothGattReadResponse {
+            address: ADDRESS,
+            handle: 0x2A,
+            data: &[0x64],
+        };
+        assert_encodes(&read, "08a2a280c0939829102a1a0164");
+        let notification = BluetoothGattNotifyDataResponse {
+            address: ADDRESS,
+            handle: 0x2A,
+            data: &[0x63],
+        };
+        assert_encodes(&notification, "08a2a280c0939829102a1a0163");
+        let written = BluetoothGattWriteResponse {
+            address: ADDRESS,
+            handle: 0x2A,
+        };
+        assert_encodes(&written, "08a2a280c0939829102a");
+        let notifying = BluetoothGattNotifyResponse {
+            address: ADDRESS,
+            handle: 0x2A,
+        };
+        assert_encodes(&notifying, "08a2a280c0939829102a");
+        let error = BluetoothGattErrorResponse {
+            address: ADDRESS,
+            handle: 0x2A,
+            error: bluetooth_error::NOT_CONNECTED,
+        };
+        assert_encodes(&error, "08a2a280c0939829102a18ffffffffffffffffff01");
+        let error = BluetoothGattErrorResponse {
+            error: bluetooth_error::INSUFFICIENT_AUTHENTICATION,
+            ..error
+        };
+        assert_encodes(&error, "08a2a280c0939829102a1805");
+    }
+
+    #[test]
+    fn encodes_free_connection_slots() {
+        let free = BluetoothConnectionsFreeResponse {
+            free: 2,
+            limit: 3,
+            allocated: &[ADDRESS],
+        };
+        assert_encodes(&free, "080210031a07a2a280c0939829");
     }
 
     #[test]

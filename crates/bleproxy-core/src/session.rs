@@ -76,7 +76,7 @@ pub enum Reply<'a> {
     /// Ends the (empty) entity list.
     ListEntitiesDone(ListEntitiesDoneResponse),
     /// Reports that no active connections are available.
-    ConnectionsFree(BluetoothConnectionsFreeResponse),
+    ConnectionsFree(BluetoothConnectionsFreeResponse<'a>),
     /// Reports the scanner's state and mode.
     ScannerState(BluetoothScannerStateResponse),
 }
@@ -433,6 +433,7 @@ mod tests {
                 Some(Reply::ConnectionsFree(BluetoothConnectionsFreeResponse {
                     free: 0,
                     limit: 0,
+                    allocated: &[],
                 })),
             ),
             (ClientMessage::Authentication, None),

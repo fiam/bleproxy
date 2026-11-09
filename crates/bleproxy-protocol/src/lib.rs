@@ -6,8 +6,8 @@
 //! radios, and it is `no_std` so the same code runs on hosts and
 //! microcontrollers.
 //!
-//! It covers plaintext framing and the messages a passive Bluetooth proxy
-//! exchanges. Noise-encrypted framing will live here as well.
+//! It covers plaintext and Noise-encrypted framing, and the messages a
+//! Bluetooth proxy exchanges.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -20,9 +20,14 @@ pub mod wire;
 
 pub use frame::{FrameError, FrameHeader, MAX_HEADER_LEN, PLAINTEXT_INDICATOR, encode_frame};
 pub use messages::{
-    API_VERSION, BluetoothConnectionsFreeResponse, BluetoothLeRawAdvertisementsResponse,
-    BluetoothScannerStateResponse, ClientMessage, DeviceInfoResponse, DisconnectRequest,
-    DisconnectResponse, HelloRequest, HelloResponse, ListEntitiesDoneResponse, Message,
-    PingRequest, PingResponse, RawAdvertisement, bluetooth_proxy_feature,
+    API_VERSION, BluetoothConnectionsFreeResponse, BluetoothDeviceConnectionResponse,
+    BluetoothDeviceRequest, BluetoothGattCharacteristic, BluetoothGattDescriptor,
+    BluetoothGattErrorResponse, BluetoothGattGetServicesDoneResponse,
+    BluetoothGattGetServicesResponse, BluetoothGattNotifyDataResponse, BluetoothGattNotifyResponse,
+    BluetoothGattReadResponse, BluetoothGattService, BluetoothGattWriteResponse,
+    BluetoothLeRawAdvertisementsResponse, BluetoothScannerStateResponse, ClientMessage,
+    DeviceInfoResponse, DisconnectRequest, DisconnectResponse, HelloRequest, HelloResponse,
+    ListEntitiesDoneResponse, Message, PingRequest, PingResponse, RawAdvertisement,
+    bluetooth_device_request_type, bluetooth_error, bluetooth_proxy_feature,
     bluetooth_proxy_subscription, bluetooth_scanner_mode, bluetooth_scanner_state, message_type,
 };
