@@ -1,0 +1,4 @@
+[profile.default]
+# Report tests slower than 30 seconds and kill them after two minutes, so a
+# hung test fails quickly instead of stalling CI until its job timeout.
+slow-timeout = { period = "30s", terminate-after = 4 }
