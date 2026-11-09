@@ -6,14 +6,21 @@
 //! radios, and it is `no_std` so the same code runs on hosts and
 //! microcontrollers.
 //!
-//! Only the plaintext frame header is implemented so far. Noise-encrypted
-//! frames and the protobuf messages themselves will live here as well.
+//! It covers plaintext framing and the messages a passive Bluetooth proxy
+//! exchanges. Noise-encrypted framing will live here as well.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 mod frame;
+mod messages;
 mod varint;
 pub mod wire;
 
 pub use frame::{FrameError, FrameHeader, MAX_HEADER_LEN, PLAINTEXT_INDICATOR};
+pub use messages::{
+    API_VERSION, BluetoothConnectionsFreeResponse, BluetoothLeRawAdvertisementsResponse,
+    ClientMessage, DeviceInfoResponse, DisconnectRequest, DisconnectResponse, HelloRequest,
+    HelloResponse, ListEntitiesDoneResponse, Message, PingRequest, PingResponse, RawAdvertisement,
+    bluetooth_proxy_feature, bluetooth_proxy_subscription, message_type,
+};
