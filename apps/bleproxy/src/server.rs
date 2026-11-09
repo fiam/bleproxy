@@ -9,10 +9,9 @@ use std::time::Duration;
 use bleproxy_core::Advertisement;
 use bleproxy_core::scanner::ScannerStatus;
 use bleproxy_core::session::{Reply, Session};
-use bleproxy_protocol::wire::{DecodeError, EncodeError};
+use bleproxy_protocol::wire::{DecodeError, Encode, EncodeError};
 use bleproxy_protocol::{
-    BluetoothLeRawAdvertisementsResponse, ClientMessage, FrameError, FrameHeader, RawAdvertisement,
-    encode_frame,
+    BluetoothLeRawAdvertisementsResponse, ClientMessage, Message as _, RawAdvertisement,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -21,11 +20,9 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::Identity;
+use crate::encryption::EncryptionKey;
 use crate::scanner::ScannerHandle;
-
-/// Largest client message payload accepted, in bytes. Clients only send
-/// small requests, so anything bigger is a broken or hostile peer.
-pub const MAX_PAYLOAD_LEN: usize = 16 * 1024;
+use crate::transport::{Message, Transport, TransportError};
 
 /// Most advertisements sent in one message, as ESPHome does.
 const BATCH_SIZE: usize = 16;
@@ -37,9 +34,9 @@ const BATCH_INTERVAL: Duration = Duration::from_millis(100);
 /// every 20 seconds or so.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Size of the buffer replies are encoded into. A full advertisement batch
-/// is under 1.5 KiB.
-const OUTPUT_BUFFER_LEN: usize = 4096;
+/// Size of the buffer message payloads are encoded into. A full
+/// advertisement batch is under 1.5 KiB.
+const PAYLOAD_BUFFER_LEN: usize = 4096;
 
 /// Errors that end a client connection.
 #[derive(Debug, thiserror::Error)]
@@ -48,16 +45,13 @@ pub enum ConnectionError {
     /// Reading from or writing to the socket failed.
     #[error(transparent)]
     Io(#[from] io::Error),
-    /// The client sent an invalid frame.
-    #[error("invalid frame: {0}")]
-    Frame(#[from] FrameError),
+    /// The client violated the framing or the encryption handshake failed.
+    #[error(transparent)]
+    Transport(#[from] TransportError),
     /// The client sent an invalid message.
     #[error("invalid message: {0}")]
     Decode(#[from] DecodeError),
-    /// The client announced a message larger than [`MAX_PAYLOAD_LEN`].
-    #[error("message of {0} bytes exceeds the {MAX_PAYLOAD_LEN} byte limit")]
-    MessageTooLarge(u32),
-    /// A reply did not fit the output buffer.
+    /// A reply did not fit the payload buffer.
     #[error("reply too large: {0}")]
     Encode(#[from] EncodeError),
 }
@@ -71,6 +65,8 @@ pub struct Context {
     pub advertisements: broadcast::Sender<Advertisement>,
     /// The scanner, if clients may follow its state and switch its mode.
     pub scanner: Option<ScannerHandle>,
+    /// Key that encrypts every connection, or `None` for plaintext.
+    pub encryption: Option<EncryptionKey>,
 }
 
 /// Accepts API connections on `listener` until `shutdown` completes.
@@ -117,13 +113,20 @@ pub async fn handle_connection(
     context: &Context,
 ) -> Result<(), ConnectionError> {
     stream.set_nodelay(true)?;
-    let (mut reader, mut writer) = stream.into_split();
-    let device = context.identity.device_identity();
+    let (mut reader, writer) = stream.into_split();
+    let identity = &context.identity;
+    let transport = context
+        .encryption
+        .as_ref()
+        .map_or(Transport::Plaintext, |key| {
+            Transport::noise(key, identity.name(), &identity.mac_hex())
+        });
+    let mut out = Outbound::new(writer, transport);
+    let device = identity.device_identity();
     let mut session = Session::new(&device);
     let mut scanner_status = context.scanner.as_ref().map(ScannerHandle::status);
 
     let mut inbox = Vec::with_capacity(1024);
-    let mut out = vec![0; OUTPUT_BUFFER_LEN];
     let mut subscription: Option<broadcast::Receiver<Advertisement>> = None;
     let mut batch = Vec::with_capacity(BATCH_SIZE);
     let mut flush = tokio::time::interval(BATCH_INTERVAL);
@@ -138,22 +141,19 @@ pub async fn handle_connection(
                     return Ok(());
                 }
                 idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
-                while let Some((header, consumed)) = next_frame(&inbox)? {
-                    let payload = inbox.get(consumed - header.payload_len as usize..consumed)
-                        .unwrap_or_default();
-                    let message = ClientMessage::decode(header.message_type, payload)?;
+                while let Some(Message { message_type, payload }) = out.next_message(&mut inbox).await? {
+                    let message = ClientMessage::decode(message_type, &payload)?;
                     log_message(&message);
                     let outcome = session.handle(&message);
-                    inbox.drain(..consumed);
                     if let Some(reply) = outcome.reply {
-                        send_reply(&mut writer, &reply, &mut out).await?;
+                        out.reply(&reply).await?;
                     }
                     if let (Some(mode), Some(scanner)) = (outcome.scan_mode, &context.scanner) {
                         info!(?mode, "client requested a scan mode");
                         scanner.request(mode);
                     }
                     if outcome.close {
-                        writer.shutdown().await?;
+                        out.writer.shutdown().await?;
                         return Ok(());
                     }
                 }
@@ -166,7 +166,7 @@ pub async fn handle_connection(
                         if let Some(status) = &mut scanner_status {
                             let current = *status.borrow_and_update();
                             if let Some(reply) = session.scanner_state(current) {
-                                send_reply(&mut writer, &reply, &mut out).await?;
+                                out.reply(&reply).await?;
                             }
                         }
                     }
@@ -181,7 +181,7 @@ pub async fn handle_connection(
                 Ok(advertisement) => {
                     batch.push(advertisement);
                     if batch.len() >= BATCH_SIZE {
-                        send_batch(&mut writer, &mut batch, &mut out).await?;
+                        out.advertisements(&mut batch).await?;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -191,11 +191,11 @@ pub async fn handle_connection(
             },
             Some(status) = status_change(&mut scanner_status), if subscription.is_some() => {
                 if let Some(reply) = session.scanner_state(status) {
-                    send_reply(&mut writer, &reply, &mut out).await?;
+                    out.reply(&reply).await?;
                 }
             }
             _ = flush.tick(), if !batch.is_empty() => {
-                send_batch(&mut writer, &mut batch, &mut out).await?;
+                out.advertisements(&mut batch).await?;
             }
             () = &mut idle => {
                 info!("closing idle connection");
@@ -218,16 +218,6 @@ async fn status_change(
     std::future::pending().await
 }
 
-async fn send_reply(
-    writer: &mut (impl AsyncWriteExt + Unpin),
-    reply: &Reply<'_>,
-    out: &mut [u8],
-) -> Result<(), ConnectionError> {
-    let len = reply.encode_frame(out)?;
-    writer.write_all(out.get(..len).unwrap_or_default()).await?;
-    Ok(())
-}
-
 /// Receives from `subscription`, or waits forever without one.
 async fn recv(
     subscription: &mut Option<broadcast::Receiver<Advertisement>>,
@@ -238,34 +228,75 @@ async fn recv(
     }
 }
 
-/// Returns the header of the first complete frame in `buf` and the number
-/// of bytes up to the end of its payload.
-fn next_frame(buf: &[u8]) -> Result<Option<(FrameHeader, usize)>, ConnectionError> {
-    let Some((header, header_len)) = FrameHeader::decode(buf)? else {
-        return Ok(None);
-    };
-    let payload_len = header.payload_len as usize;
-    if payload_len > MAX_PAYLOAD_LEN {
-        return Err(ConnectionError::MessageTooLarge(header.payload_len));
-    }
-    let end = header_len + payload_len;
-    Ok((buf.len() >= end).then_some((header, end)))
+/// The sending side of a connection: frames messages through the
+/// connection's transport and writes them to the socket.
+struct Outbound<W> {
+    writer: W,
+    transport: Transport,
+    /// Scratch space for encoding payloads.
+    payload: Vec<u8>,
+    /// Bytes waiting to be written.
+    wire: Vec<u8>,
 }
 
-async fn send_batch(
-    writer: &mut (impl AsyncWriteExt + Unpin),
-    batch: &mut Vec<Advertisement>,
-    out: &mut [u8],
-) -> Result<(), ConnectionError> {
-    let raw: Vec<RawAdvertisement<'_>> = batch.iter().map(Advertisement::as_raw).collect();
-    let response = BluetoothLeRawAdvertisementsResponse {
-        advertisements: &raw,
-    };
-    let len = encode_frame(&response, out)?;
-    writer.write_all(out.get(..len).unwrap_or_default()).await?;
-    debug!(count = batch.len(), "forwarded advertisements");
-    batch.clear();
-    Ok(())
+impl<W: AsyncWriteExt + Unpin> Outbound<W> {
+    fn new(writer: W, transport: Transport) -> Self {
+        Self {
+            writer,
+            transport,
+            payload: vec![0; PAYLOAD_BUFFER_LEN],
+            wire: Vec::with_capacity(PAYLOAD_BUFFER_LEN),
+        }
+    }
+
+    /// Takes the next message out of `inbox`. Whatever the transport has
+    /// to say to the client (handshake replies, or why it gives up) is
+    /// sent first, even if reading fails.
+    async fn next_message(
+        &mut self,
+        inbox: &mut Vec<u8>,
+    ) -> Result<Option<Message>, ConnectionError> {
+        let result = self.transport.read(inbox, &mut self.wire);
+        self.flush().await?;
+        Ok(result?)
+    }
+
+    async fn reply(&mut self, reply: &Reply<'_>) -> Result<(), ConnectionError> {
+        let len = reply.encode_payload(&mut self.payload)?;
+        self.send(reply.message_type(), len).await
+    }
+
+    async fn advertisements(
+        &mut self,
+        batch: &mut Vec<Advertisement>,
+    ) -> Result<(), ConnectionError> {
+        let raw: Vec<RawAdvertisement<'_>> = batch.iter().map(Advertisement::as_raw).collect();
+        let response = BluetoothLeRawAdvertisementsResponse {
+            advertisements: &raw,
+        };
+        let len = response.encode_to_slice(&mut self.payload)?;
+        self.send(BluetoothLeRawAdvertisementsResponse::TYPE, len)
+            .await?;
+        debug!(count = batch.len(), "forwarded advertisements");
+        batch.clear();
+        Ok(())
+    }
+
+    /// Sends the first `len` bytes of the payload buffer as a message.
+    async fn send(&mut self, message_type: u16, len: usize) -> Result<(), ConnectionError> {
+        let payload = self.payload.get(..len).unwrap_or_default();
+        self.transport
+            .write(message_type, payload, &mut self.wire)?;
+        self.flush().await
+    }
+
+    async fn flush(&mut self) -> Result<(), ConnectionError> {
+        if !self.wire.is_empty() {
+            self.writer.write_all(&self.wire).await?;
+            self.wire.clear();
+        }
+        Ok(())
+    }
 }
 
 fn log_message(message: &ClientMessage<'_>) {
@@ -288,30 +319,10 @@ fn log_message(message: &ClientMessage<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use bleproxy_protocol::MAX_HEADER_LEN;
-
     use super::*;
 
     #[test]
-    fn finds_complete_frames() {
-        assert!(next_frame(&[]).unwrap().is_none());
-        // Header announcing 2 bytes, only 1 present.
-        assert!(next_frame(&[0x00, 0x02, 0x07, 0xAA]).unwrap().is_none());
-        let (header, end) = next_frame(&[0x00, 0x02, 0x07, 0xAA, 0xBB, 0xCC])
-            .unwrap()
-            .unwrap();
-        assert_eq!((header.payload_len, header.message_type, end), (2, 7, 5));
-    }
-
-    #[test]
-    fn rejects_oversized_frames() {
-        // 0x80 0x80 0x02 = 32768 bytes.
-        let err = next_frame(&[0x00, 0x80, 0x80, 0x02, 0x07]).unwrap_err();
-        assert!(matches!(err, ConnectionError::MessageTooLarge(32768)));
-    }
-
-    #[test]
-    fn output_buffer_fits_a_full_batch() {
+    fn payload_buffer_fits_a_full_batch() {
         let data = [0xAA; bleproxy_core::AdvData::MAX_LEN];
         let raw = [RawAdvertisement {
             address: u64::from(u32::MAX) << 16,
@@ -322,8 +333,6 @@ mod tests {
         let response = BluetoothLeRawAdvertisementsResponse {
             advertisements: &raw,
         };
-        let mut out = vec![0; OUTPUT_BUFFER_LEN];
-        let len = encode_frame(&response, &mut out).unwrap();
-        assert!(len + MAX_HEADER_LEN < OUTPUT_BUFFER_LEN);
+        assert!(response.encoded_len() < PAYLOAD_BUFFER_LEN);
     }
 }

@@ -6,9 +6,11 @@
 
 #[cfg(target_os = "linux")]
 pub mod bluez;
+pub mod encryption;
 pub mod identity;
 pub mod mdns;
 pub mod scanner;
 pub mod server;
+pub mod transport;
 
 pub use identity::Identity;

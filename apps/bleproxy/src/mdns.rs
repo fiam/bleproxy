@@ -7,6 +7,8 @@ use std::time::Duration;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tracing::warn;
 
+use bleproxy_protocol::noise::NOISE_PROTOCOL;
+
 use crate::Identity;
 
 /// Service type ESPHome devices register.
@@ -72,20 +74,22 @@ impl Announcement {
 }
 
 /// TXT records in the form ESPHome publishes them. Home Assistant uses
-/// `mac` to recognize the device and `friendly_name` as its title.
+/// `mac` to recognize the device, `friendly_name` as its title, and asks
+/// for the encryption key when `api_encryption` is present.
 fn txt_records(identity: &Identity) -> Vec<(&'static str, String)> {
-    vec![
+    let mut records = vec![
         ("friendly_name", identity.friendly_name().to_owned()),
         ("version", Identity::VERSION.to_owned()),
-        (
-            "mac",
-            identity.mac_address().replace(':', "").to_lowercase(),
-        ),
+        ("mac", identity.mac_hex()),
         ("platform", std::env::consts::OS.to_owned()),
         ("board", std::env::consts::ARCH.to_owned()),
         ("project_name", Identity::PROJECT_NAME.to_owned()),
         ("project_version", Identity::VERSION.to_owned()),
-    ]
+    ];
+    if identity.encrypted() {
+        records.push(("api_encryption", NOISE_PROTOCOL.to_owned()));
+    }
+    records
 }
 
 #[cfg(test)]
@@ -109,5 +113,13 @@ mod tests {
         assert_eq!(get("friendly_name"), Some("Kitchen"));
         assert_eq!(get("project_name"), Some("fiam.bleproxy"));
         assert_eq!(get("version"), Some(Identity::VERSION));
+        assert_eq!(get("api_encryption"), None);
+
+        let encrypted = txt_records(&identity.with_encryption());
+        let encryption = encrypted.iter().find(|(key, _)| *key == "api_encryption");
+        assert_eq!(
+            encryption.map(|(_, value)| value.as_str()),
+            Some("Noise_NNpsk0_25519_ChaChaPoly_SHA256")
+        );
     }
 }

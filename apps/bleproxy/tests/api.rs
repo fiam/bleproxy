@@ -52,6 +52,7 @@ impl Proxy {
             identity: Arc::new(identity),
             advertisements: advertisements.clone(),
             scanner,
+            encryption: None,
         };
         tokio::spawn(server::serve(listener, context, async move {
             let _ = stopped.await;

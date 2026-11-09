@@ -25,7 +25,9 @@ authors = ["The bleproxy contributors"]
 bleproxy-core = { path = "crates/bleproxy-core" }
 bleproxy-protocol = { path = "crates/bleproxy-protocol" }
 
+base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+getrandom = "0.4.3"
 futures-util = { version = "0.3.34", default-features = false }
 mdns-sd = "0.21.7"
 # `default-features = false` keeps it usable from `no_std` crates.
@@ -33,6 +35,11 @@ thiserror = { version = "2.0.21", default-features = false }
 tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "fmt", "std"] }
+# Only the primitives of ESPHome's Noise_NNpsk0_25519_ChaChaPoly_SHA256.
+# Its `std` feature would pull in ring, a C dependency, and its getrandom
+# feature an older getrandom than the rest of the graph; randomness comes
+# from getrandom through a resolver instead (see apps/bleproxy/src/transport.rs).
+snow = { version = "0.10.0", default-features = false, features = ["use-chacha20poly1305", "use-curve25519", "use-sha2"] }
 # Pure Rust, so the BlueZ backend needs no libdbus and links statically.
 zbus = { version = "6.2.1", default-features = false, features = ["object-manager", "tokio"] }
 

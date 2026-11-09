@@ -29,6 +29,7 @@ pub struct Identity {
     model: String,
     server_info: String,
     scanner: Option<ScanMode>,
+    encrypted: bool,
 }
 
 impl Identity {
@@ -71,7 +72,21 @@ impl Identity {
             model: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
             server_info: format!("bleproxy {}", Self::VERSION),
             scanner: None,
+            encrypted: false,
         })
+    }
+
+    /// Declares that the API is encrypted.
+    #[must_use]
+    pub const fn with_encryption(mut self) -> Self {
+        self.encrypted = true;
+        self
+    }
+
+    /// Whether the API is encrypted.
+    #[must_use]
+    pub const fn encrypted(&self) -> bool {
+        self.encrypted
     }
 
     /// Declares a scanner configured with `mode` whose mode clients may
@@ -100,6 +115,13 @@ impl Identity {
         &self.mac_address
     }
 
+    /// MAC address as 12 lowercase hex digits, the form ESPHome uses in
+    /// mDNS and in the encryption handshake.
+    #[must_use]
+    pub fn mac_hex(&self) -> String {
+        self.mac_address.replace(':', "").to_lowercase()
+    }
+
     /// Model reported to clients (operating system and architecture).
     #[must_use]
     pub fn model(&self) -> &str {
@@ -120,7 +142,7 @@ impl Identity {
             version: Self::VERSION,
             server_info: &self.server_info,
             scanner: self.scanner,
-            encrypted: false,
+            encrypted: self.encrypted,
         }
     }
 }
@@ -178,6 +200,15 @@ mod tests {
         assert_eq!(identity.name(), "bleproxy-a1b2c3");
         assert_eq!(identity.friendly_name(), "bleproxy A1B2C3");
         assert_eq!(identity.mac_address(), "AA:BB:CC:A1:B2:C3");
+        assert_eq!(identity.mac_hex(), "aabbcca1b2c3");
+        assert!(!identity.encrypted());
+        assert!(
+            identity
+                .clone()
+                .with_encryption()
+                .device_identity()
+                .encrypted
+        );
         let device = identity.device_identity();
         assert_eq!(device.project_name, "fiam.bleproxy");
         assert_eq!(

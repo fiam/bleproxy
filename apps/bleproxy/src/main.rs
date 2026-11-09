@@ -3,9 +3,11 @@
 use std::error::Error;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use bleproxy::encryption::EncryptionKey;
 use bleproxy::identity::validate_name;
 use bleproxy::mdns::Announcement;
 use bleproxy::{Identity, server};
@@ -48,6 +50,23 @@ struct Cli {
     #[cfg(target_os = "linux")]
     #[arg(long, env = "BLEPROXY_SCAN_MODE", value_enum, default_value_t)]
     scan_mode: ScanModeArg,
+
+    /// Key that encrypts the API, as 32 bytes of base64 (ESPHome's
+    /// `api: encryption: key:`). Generate one with
+    /// `openssl rand -base64 32`; Home Assistant asks for it when adding the
+    /// proxy.
+    #[arg(
+        long,
+        env = "BLEPROXY_ENCRYPTION_KEY",
+        hide_env_values = true,
+        conflicts_with = "encryption_key_file"
+    )]
+    encryption_key: Option<EncryptionKey>,
+
+    /// File holding the encryption key, to keep it out of the environment
+    /// (for example a Docker secret or a systemd credential).
+    #[arg(long, env = "BLEPROXY_ENCRYPTION_KEY_FILE")]
+    encryption_key_file: Option<PathBuf>,
 
     /// Address and port for the ESPHome API.
     #[arg(long, env = "BLEPROXY_LISTEN", default_value = "0.0.0.0:6053")]
@@ -107,6 +126,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     if let Some(name) = &cli.name {
         validate_name(name)?;
     }
+    let encryption = match (cli.encryption_key, &cli.encryption_key_file) {
+        (Some(key), _) => Some(key),
+        (None, Some(path)) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+            Some(text.parse::<EncryptionKey>()?)
+        }
+        (None, None) => None,
+    };
     let (advertisements, _) = broadcast::channel(1024);
 
     #[cfg(target_os = "linux")]
@@ -136,6 +164,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     if let Some(scanner) = &scanner {
         identity = identity.with_scanner(scanner.configured());
     }
+    if encryption.is_some() {
+        identity = identity.with_encryption();
+    }
     let identity = Arc::new(identity);
 
     let listener = TcpListener::bind(cli.listen).await?;
@@ -144,6 +175,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         name = identity.name(),
         mac = identity.mac_address(),
         %address,
+        encrypted = identity.encrypted(),
         "bleproxy {} serving the ESPHome API",
         Identity::VERSION,
     );
@@ -159,6 +191,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         identity,
         advertisements,
         scanner,
+        encryption,
     };
     let served = server::serve(listener, context, shutdown_signal()).await;
     info!("shutting down");

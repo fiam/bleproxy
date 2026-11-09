@@ -31,7 +31,8 @@ ignore = [
 [licenses]
 # Everything must be compatible with distributing bleproxy under
 # MIT OR Apache-2.0. Extend this list deliberately, never with copyleft.
-allow = ["Apache-2.0", "ISC", "MIT", "Unicode-3.0"]
+# BSD-3-Clause: curve25519-dalek and subtle, behind the API encryption.
+allow = ["Apache-2.0", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0"]
 confidence-threshold = 0.93
 # Fail when an allowed license is no longer used, keeping the list minimal.
 unused-allowed-license = "deny"
