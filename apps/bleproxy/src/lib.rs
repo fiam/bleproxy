@@ -6,6 +6,7 @@
 
 #[cfg(target_os = "linux")]
 pub mod bluez;
+pub mod connections;
 pub mod encryption;
 pub mod identity;
 pub mod mdns;

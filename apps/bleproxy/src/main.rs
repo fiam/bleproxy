@@ -192,6 +192,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         advertisements,
         scanner,
         encryption,
+        connections: None,
     };
     let served = server::serve(listener, context, shutdown_signal()).await;
     info!("shutting down");

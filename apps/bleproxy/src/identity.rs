@@ -30,6 +30,7 @@ pub struct Identity {
     server_info: String,
     scanner: Option<ScanMode>,
     encrypted: bool,
+    connections: bool,
 }
 
 impl Identity {
@@ -73,6 +74,7 @@ impl Identity {
             server_info: format!("bleproxy {}", Self::VERSION),
             scanner: None,
             encrypted: false,
+            connections: false,
         })
     }
 
@@ -94,6 +96,13 @@ impl Identity {
     #[must_use]
     pub const fn with_scanner(mut self, mode: ScanMode) -> Self {
         self.scanner = Some(mode);
+        self
+    }
+
+    /// Declares that the proxy connects to devices for clients.
+    #[must_use]
+    pub const fn with_connections(mut self) -> Self {
+        self.connections = true;
         self
     }
 
@@ -143,7 +152,7 @@ impl Identity {
             server_info: &self.server_info,
             scanner: self.scanner,
             encrypted: self.encrypted,
-            connections: false,
+            connections: self.connections,
         }
     }
 }
@@ -203,6 +212,14 @@ mod tests {
         assert_eq!(identity.mac_address(), "AA:BB:CC:A1:B2:C3");
         assert_eq!(identity.mac_hex(), "aabbcca1b2c3");
         assert!(!identity.encrypted());
+        assert!(!identity.device_identity().connections);
+        assert!(
+            identity
+                .clone()
+                .with_connections()
+                .device_identity()
+                .connections
+        );
         assert!(
             identity
                 .clone()

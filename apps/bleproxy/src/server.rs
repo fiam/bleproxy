@@ -7,11 +7,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bleproxy_core::Advertisement;
-use bleproxy_core::scanner::ScannerStatus;
-use bleproxy_core::session::{Reply, Session};
-use bleproxy_protocol::wire::{DecodeError, Encode, EncodeError};
+use bleproxy_core::connection::ConnectionRequest;
+use bleproxy_core::session::{Outcome, Reply, Session};
+use bleproxy_protocol::wire::{DecodeError, EncodeError};
 use bleproxy_protocol::{
-    BluetoothLeRawAdvertisementsResponse, ClientMessage, Message as _, RawAdvertisement,
+    BluetoothConnectionsFreeResponse, BluetoothDeviceConnectionResponse,
+    BluetoothGattCharacteristic, BluetoothGattDescriptor, BluetoothGattErrorResponse,
+    BluetoothGattGetServicesDoneResponse, BluetoothGattGetServicesResponse,
+    BluetoothGattNotifyDataResponse, BluetoothGattNotifyResponse, BluetoothGattReadResponse,
+    BluetoothGattService, BluetoothGattWriteResponse, BluetoothLeRawAdvertisementsResponse,
+    ClientMessage, RawAdvertisement,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -20,6 +25,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::Identity;
+use crate::connections::{Client, ConnectionsHandle, Event, Service, Slots};
 use crate::encryption::EncryptionKey;
 use crate::scanner::ScannerHandle;
 use crate::transport::{Message, Transport, TransportError};
@@ -34,8 +40,9 @@ const BATCH_INTERVAL: Duration = Duration::from_millis(100);
 /// every 20 seconds or so.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Size of the buffer message payloads are encoded into. A full
-/// advertisement batch is under 1.5 KiB.
+/// Initial size of the buffer message payloads are encoded into. A full
+/// advertisement batch is under 1.5 KiB; the buffer grows for larger
+/// messages, such as services with many characteristics.
 const PAYLOAD_BUFFER_LEN: usize = 4096;
 
 /// Errors that end a client connection.
@@ -67,6 +74,8 @@ pub struct Context {
     pub scanner: Option<ScannerHandle>,
     /// Key that encrypts every connection, or `None` for plaintext.
     pub encryption: Option<EncryptionKey>,
+    /// The connection manager, if clients may connect to devices.
+    pub connections: Option<ConnectionsHandle>,
 }
 
 /// Accepts API connections on `listener` until `shutdown` completes.
@@ -125,6 +134,8 @@ pub async fn handle_connection(
     let device = identity.device_identity();
     let mut session = Session::new(&device);
     let mut scanner_status = context.scanner.as_ref().map(ScannerHandle::status);
+    let mut connections = context.connections.as_ref().map(ConnectionsHandle::client);
+    let mut slots = None;
 
     let mut inbox = Vec::with_capacity(1024);
     let mut subscription: Option<broadcast::Receiver<Advertisement>> = None;
@@ -148,10 +159,7 @@ pub async fn handle_connection(
                     if let Some(reply) = outcome.reply {
                         out.reply(&reply).await?;
                     }
-                    if let (Some(mode), Some(scanner)) = (outcome.scan_mode, &context.scanner) {
-                        info!(?mode, "client requested a scan mode");
-                        scanner.request(mode);
-                    }
+                    forward(&outcome, context, connections.as_ref());
                     if outcome.close {
                         out.writer.shutdown().await?;
                         return Ok(());
@@ -176,7 +184,18 @@ pub async fn handle_connection(
                     }
                     _ => {}
                 }
+                // Report the free slots to new subscribers, then follow them.
+                if slots.is_none() && session.wants_connections_free()
+                    && let Some(handle) = &context.connections
+                {
+                    let mut receiver = handle.slots();
+                    let current = receiver.borrow_and_update().clone();
+                    out.slots(&current).await?;
+                    slots = Some(receiver);
+                }
             }
+            event = next_event(&mut connections) => out.event(&event).await?,
+            Some(current) = changed(&mut slots) => out.slots(&current).await?,
             received = recv(&mut subscription) => match received {
                 Ok(advertisement) => {
                     batch.push(advertisement);
@@ -189,7 +208,7 @@ pub async fn handle_connection(
                 }
                 Err(broadcast::error::RecvError::Closed) => subscription = None,
             },
-            Some(status) = status_change(&mut scanner_status), if subscription.is_some() => {
+            Some(status) = changed(&mut scanner_status), if subscription.is_some() => {
                 if let Some(reply) = session.scanner_state(status) {
                     out.reply(&reply).await?;
                 }
@@ -205,17 +224,36 @@ pub async fn handle_connection(
     }
 }
 
-/// Waits for the scanner's status to change. Never completes without a
-/// scanner, or once the scanner is gone.
-async fn status_change(
-    status: &mut Option<watch::Receiver<ScannerStatus>>,
-) -> Option<ScannerStatus> {
-    if let Some(receiver) = status
+/// Passes the scan mode and connection requests in `outcome` on to the
+/// scanner and the connection manager.
+fn forward(outcome: &Outcome<'_, '_>, context: &Context, client: Option<&Client>) {
+    if let (Some(mode), Some(scanner)) = (outcome.scan_mode, &context.scanner) {
+        info!(?mode, "client requested a scan mode");
+        scanner.request(mode);
+    }
+    if let (Some(request), Some(client)) = (outcome.connection, client) {
+        log_request(&request);
+        client.request(request.map_data(<[u8]>::to_vec));
+    }
+}
+
+/// Waits for a watched value to change, and returns it. Never completes
+/// without a receiver, or once the sender is gone.
+async fn changed<T: Clone + Send + Sync>(receiver: &mut Option<watch::Receiver<T>>) -> Option<T> {
+    if let Some(receiver) = receiver
         && receiver.changed().await.is_ok()
     {
-        return Some(*receiver.borrow_and_update());
+        return Some(receiver.borrow_and_update().clone());
     }
     std::future::pending().await
+}
+
+/// Waits for the next connection event, or forever without connections.
+async fn next_event(client: &mut Option<Client>) -> Event {
+    match client {
+        Some(client) => client.event().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Receives from `subscription`, or waits forever without one.
@@ -271,15 +309,155 @@ impl<W: AsyncWriteExt + Unpin> Outbound<W> {
         batch: &mut Vec<Advertisement>,
     ) -> Result<(), ConnectionError> {
         let raw: Vec<RawAdvertisement<'_>> = batch.iter().map(Advertisement::as_raw).collect();
-        let response = BluetoothLeRawAdvertisementsResponse {
+        self.message(&BluetoothLeRawAdvertisementsResponse {
             advertisements: &raw,
-        };
-        let len = response.encode_to_slice(&mut self.payload)?;
-        self.send(BluetoothLeRawAdvertisementsResponse::TYPE, len)
-            .await?;
+        })
+        .await?;
         debug!(count = batch.len(), "forwarded advertisements");
         batch.clear();
         Ok(())
+    }
+
+    async fn slots(&mut self, slots: &Slots) -> Result<(), ConnectionError> {
+        let allocated: Vec<u64> = slots.allocated.iter().map(|a| a.to_u64()).collect();
+        self.message(&BluetoothConnectionsFreeResponse {
+            free: slots.free(),
+            limit: slots.limit,
+            allocated: &allocated,
+        })
+        .await
+    }
+
+    async fn event(&mut self, event: &Event) -> Result<(), ConnectionError> {
+        match event {
+            Event::Connection {
+                address,
+                connected,
+                mtu,
+                error,
+            } => {
+                info!(%address, connected, mtu, error, "device connection changed");
+                self.message(&BluetoothDeviceConnectionResponse {
+                    address: address.to_u64(),
+                    connected: *connected,
+                    mtu: (*mtu).into(),
+                    error: *error,
+                })
+                .await
+            }
+            Event::Services { address, services } => {
+                let address = address.to_u64();
+                // One service per message keeps messages small.
+                for service in services {
+                    self.service(address, service).await?;
+                }
+                self.message(&BluetoothGattGetServicesDoneResponse { address })
+                    .await
+            }
+            Event::Read {
+                address,
+                handle,
+                data,
+            } => {
+                self.message(&BluetoothGattReadResponse {
+                    address: address.to_u64(),
+                    handle: *handle,
+                    data,
+                })
+                .await
+            }
+            Event::Written { address, handle } => {
+                self.message(&BluetoothGattWriteResponse {
+                    address: address.to_u64(),
+                    handle: *handle,
+                })
+                .await
+            }
+            Event::Notifying { address, handle } => {
+                self.message(&BluetoothGattNotifyResponse {
+                    address: address.to_u64(),
+                    handle: *handle,
+                })
+                .await
+            }
+            Event::Notification {
+                address,
+                handle,
+                data,
+            } => {
+                self.message(&BluetoothGattNotifyDataResponse {
+                    address: address.to_u64(),
+                    handle: *handle,
+                    data,
+                })
+                .await
+            }
+            Event::Error {
+                address,
+                handle,
+                error,
+            } => {
+                debug!(%address, handle, error, "GATT operation failed");
+                self.message(&BluetoothGattErrorResponse {
+                    address: address.to_u64(),
+                    handle: *handle,
+                    error: *error,
+                })
+                .await
+            }
+        }
+    }
+
+    async fn service(&mut self, address: u64, service: &Service) -> Result<(), ConnectionError> {
+        let descriptors: Vec<Vec<BluetoothGattDescriptor>> = service
+            .characteristics
+            .iter()
+            .map(|characteristic| {
+                characteristic
+                    .descriptors
+                    .iter()
+                    .map(|descriptor| BluetoothGattDescriptor {
+                        uuid: descriptor.uuid.as_u128(),
+                        handle: descriptor.handle.into(),
+                    })
+                    .collect()
+            })
+            .collect();
+        let characteristics: Vec<BluetoothGattCharacteristic<'_>> = service
+            .characteristics
+            .iter()
+            .zip(&descriptors)
+            .map(
+                |(characteristic, descriptors)| BluetoothGattCharacteristic {
+                    uuid: characteristic.uuid.as_u128(),
+                    handle: characteristic.handle.into(),
+                    properties: characteristic.properties.into(),
+                    descriptors,
+                },
+            )
+            .collect();
+        self.message(&BluetoothGattGetServicesResponse {
+            address,
+            services: &[BluetoothGattService {
+                uuid: service.uuid.as_u128(),
+                handle: service.handle.into(),
+                characteristics: &characteristics,
+            }],
+        })
+        .await
+    }
+
+    /// Encodes and sends `message`, growing the payload buffer if needed.
+    async fn message<M: bleproxy_protocol::Message + Sync>(
+        &mut self,
+        message: &M,
+    ) -> Result<(), ConnectionError> {
+        let len = message.encoded_len();
+        if self.payload.len() < len {
+            self.payload.resize(len, 0);
+        }
+        let len = message.encode_to_slice(&mut self.payload)?;
+        self.send(M::TYPE, len).await
     }
 
     /// Sends the first `len` bytes of the payload buffer as a message.
@@ -296,6 +474,19 @@ impl<W: AsyncWriteExt + Unpin> Outbound<W> {
             self.wire.clear();
         }
         Ok(())
+    }
+}
+
+fn log_request(request: &ConnectionRequest<&[u8]>) {
+    match request {
+        ConnectionRequest::Connect {
+            address,
+            address_type,
+        } => info!(%address, ?address_type, "client asked to connect"),
+        ConnectionRequest::Disconnect { address } => {
+            info!(%address, "client asked to disconnect");
+        }
+        other => debug!(?other, "connection request"),
     }
 }
 
@@ -319,10 +510,12 @@ fn log_message(message: &ClientMessage<'_>) {
 
 #[cfg(test)]
 mod tests {
+    use bleproxy_protocol::wire::Encode as _;
+
     use super::*;
 
     #[test]
-    fn payload_buffer_fits_a_full_batch() {
+    fn payload_buffer_starts_with_room_for_a_full_batch() {
         let data = [0xAA; bleproxy_core::AdvData::MAX_LEN];
         let raw = [RawAdvertisement {
             address: u64::from(u32::MAX) << 16,

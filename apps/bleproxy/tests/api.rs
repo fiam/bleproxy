@@ -1,13 +1,22 @@
 //! Drives the ESPHome API server over a real TCP connection, the way Home
 //! Assistant does.
 
-#![allow(clippy::expect_used, reason = "test helpers should fail loudly")]
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test helpers should fail loudly"
+)]
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use bleproxy::connections::{
+    self, Characteristic, Command, ConnectionsDriver, ConnectionsHandle, Descriptor, Event, Service,
+};
 use bleproxy::scanner::{self, ScannerDriver, ScannerHandle};
 use bleproxy::{Identity, server};
+use bleproxy_core::Uuid;
+use bleproxy_core::connection::ConnectionRequest;
 use bleproxy_core::scanner::{ScanMode, ScannerState};
 use bleproxy_core::{AddressType, AdvData, Advertisement, BdAddr};
 use bleproxy_protocol::FrameHeader;
@@ -29,22 +38,35 @@ struct Proxy {
 
 impl Proxy {
     async fn start() -> Self {
-        Self::start_with(None).await
+        Self::start_with(None, None).await
     }
 
     /// Starts a proxy with a switchable scanner, returning the driver the
     /// test plays the scanner with.
     async fn start_with_scanner(configured: ScanMode) -> (Self, ScannerDriver) {
         let (handle, driver) = scanner::channel(configured);
-        (Self::start_with(Some(handle)).await, driver)
+        (Self::start_with(Some(handle), None).await, driver)
     }
 
-    async fn start_with(scanner: Option<ScannerHandle>) -> Self {
+    /// Starts a proxy that offers connections, returning the driver the
+    /// test plays the connection manager with.
+    async fn start_with_connections(limit: u32) -> (Self, ConnectionsDriver) {
+        let (handle, driver) = connections::channel(limit);
+        (Self::start_with(None, Some(handle)).await, driver)
+    }
+
+    async fn start_with(
+        scanner: Option<ScannerHandle>,
+        connections: Option<ConnectionsHandle>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("local address");
         let mut identity = Identity::new(None, None, MAC, MAC).expect("identity");
         if let Some(scanner) = &scanner {
             identity = identity.with_scanner(scanner.configured());
+        }
+        if connections.is_some() {
+            identity = identity.with_connections();
         }
         let (advertisements, _) = broadcast::channel(64);
         let (shutdown, stopped) = oneshot::channel::<()>();
@@ -53,6 +75,7 @@ impl Proxy {
             advertisements: advertisements.clone(),
             scanner,
             encryption: None,
+            connections,
         };
         tokio::spawn(server::serve(listener, context, async move {
             let _ = stopped.await;
@@ -183,6 +206,13 @@ async fn forwards_advertisements_to_subscribers() {
     assert_eq!(entry[3].as_bytes(), Ok(&[0x02, 0x01, 0x06][..]));
 }
 
+fn hex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+        .collect()
+}
+
 fn uint_fields(payload: &[u8]) -> Vec<(u32, u32)> {
     fields(payload)
         .iter()
@@ -241,4 +271,159 @@ async fn acknowledges_disconnects() {
     proxy.hello().await;
     proxy.send(5, &[]).await;
     assert_eq!(proxy.receive().await.0, 6, "DisconnectResponse");
+}
+
+/// The device the connection tests talk to, and its address on the wire.
+const DEVICE: BdAddr = BdAddr::new([0xA4, 0xC1, 0x38, 0x00, 0x11, 0x22]);
+const DEVICE_HEX: &str = "08a2a280c0939829";
+
+/// Waits for the next request the proxy passes to the connection manager.
+async fn next_request(
+    driver: &mut ConnectionsDriver,
+) -> (connections::EventSender, connections::Request) {
+    match timeout(DEADLINE, driver.next()).await.expect("a command") {
+        Some(Command::Request {
+            events, request, ..
+        }) => (events, request),
+        other => panic!("expected a request, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn connects_devices_and_reports_free_slots() {
+    let (mut proxy, mut driver) = Proxy::start_with_connections(3).await;
+    proxy.hello().await;
+
+    proxy.send(9, &[]).await;
+    let (_, info) = proxy.receive().await;
+    let flags = fields(&info)
+        .iter()
+        .find(|field| field.number == 15)
+        .map(|field| field.as_u32().expect("flags"));
+    assert_eq!(
+        flags,
+        Some(0b10_0111),
+        "ACTIVE_CONNECTIONS and REMOTE_CACHING are offered"
+    );
+
+    // Subscribing to free slots reports them right away...
+    proxy.send(80, &[]).await;
+    let (message_type, free) = proxy.receive().await;
+    assert_eq!(message_type, 81, "BluetoothConnectionsFreeResponse");
+    assert_eq!(uint_fields(&free), [(1, 3), (2, 3)]);
+
+    // ...and connection requests reach the connection manager.
+    // BluetoothDeviceRequest { CONNECT_V3_WITH_CACHE, address type random }
+    proxy
+        .send(68, &hex(&format!("{DEVICE_HEX}100418012001")))
+        .await;
+    let (events, request) = next_request(&mut driver).await;
+    assert_eq!(
+        request,
+        ConnectionRequest::Connect {
+            address: DEVICE,
+            address_type: Some(AddressType::Random),
+        }
+    );
+
+    // Slot changes are pushed to the subscriber.
+    driver.report(vec![DEVICE]);
+    let (message_type, free) = proxy.receive().await;
+    assert_eq!(message_type, 81);
+    assert_eq!(free, hex("080210031a07a2a280c0939829"));
+
+    events.send(Event::Connection {
+        address: DEVICE,
+        connected: true,
+        mtu: 247,
+        error: 0,
+    });
+    let (message_type, connected) = proxy.receive().await;
+    assert_eq!(message_type, 69, "BluetoothDeviceConnectionResponse");
+    assert_eq!(connected, hex(&format!("{DEVICE_HEX}100118f701")));
+
+    // Closing the API connection releases the client's devices.
+    drop(proxy);
+    let command = timeout(DEADLINE, driver.next()).await.expect("a command");
+    assert!(matches!(command, Some(Command::Release(_))), "{command:?}");
+}
+
+#[tokio::test]
+async fn proxies_gatt_operations() {
+    let (mut proxy, mut driver) = Proxy::start_with_connections(3).await;
+    proxy.hello().await;
+
+    // Services come one per message, then a done message.
+    proxy.send(70, &hex(DEVICE_HEX)).await;
+    let (events, request) = next_request(&mut driver).await;
+    assert_eq!(request, ConnectionRequest::GetServices { address: DEVICE });
+    events.send(Event::Services {
+        address: DEVICE,
+        services: vec![Service {
+            uuid: Uuid::from_u16(0x180F),
+            handle: 0x28,
+            characteristics: vec![Characteristic {
+                uuid: Uuid::from_u16(0x2A19),
+                handle: 0x2A,
+                properties: 0x12,
+                descriptors: vec![Descriptor {
+                    uuid: Uuid::from_u16(0x2902),
+                    handle: 0x2B,
+                }],
+            }],
+        }],
+    });
+    let (message_type, services) = proxy.receive().await;
+    assert_eq!(message_type, 71, "BluetoothGATTGetServicesResponse");
+    assert_eq!(
+        services,
+        hex(concat!(
+            "08a2a280c093982912450a1180a08080f08106fbe9ecfc85908080800110281a",
+            "2e0a1180a0808090c30afbe9ecfc859080808001102a181222150a1180a08080",
+            "a0a00afbe9ecfc859080808001102b",
+        ))
+    );
+    let (message_type, done) = proxy.receive().await;
+    assert_eq!(message_type, 72, "BluetoothGATTGetServicesDoneResponse");
+    assert_eq!(done, hex(DEVICE_HEX));
+
+    // Written values are passed on; results come back as responses.
+    proxy
+        .send(77, &hex(&format!("{DEVICE_HEX}102b1a020100")))
+        .await;
+    let (events, request) = next_request(&mut driver).await;
+    assert_eq!(
+        request,
+        ConnectionRequest::WriteDescriptor {
+            address: DEVICE,
+            handle: 0x2B,
+            data: vec![0x01, 0x00],
+        }
+    );
+    events.send(Event::Written {
+        address: DEVICE,
+        handle: 0x2B,
+    });
+    assert_eq!(proxy.receive().await.0, 83, "BluetoothGATTWriteResponse");
+
+    events.send(Event::Notification {
+        address: DEVICE,
+        handle: 0x2A,
+        data: vec![0x63],
+    });
+    let (message_type, notification) = proxy.receive().await;
+    assert_eq!(message_type, 79, "BluetoothGATTNotifyDataResponse");
+    assert_eq!(notification, hex(&format!("{DEVICE_HEX}102a1a0163")));
+
+    events.send(Event::Error {
+        address: DEVICE,
+        handle: 0x2A,
+        error: -1,
+    });
+    let (message_type, error) = proxy.receive().await;
+    assert_eq!(message_type, 82, "BluetoothGATTErrorResponse");
+    assert_eq!(
+        error,
+        hex(&format!("{DEVICE_HEX}102a18ffffffffffffffffff01"))
+    );
 }
