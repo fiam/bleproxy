@@ -40,13 +40,14 @@ struct Cli {
     #[arg(long, env = "BLEPROXY_ADAPTER", default_value = "hci0")]
     adapter: String,
 
-    /// Scan mode. Active scanning sends scan requests and sees every
-    /// device; passive scanning only listens, saving battery-powered
-    /// devices energy, but needs BlueZ's advertisement monitor support and
-    /// misses devices that advertise without flags.
+    /// Scan mode to start in; Home Assistant can switch it at runtime.
+    /// Active scanning sends scan requests and sees every device; passive
+    /// scanning only listens, saving battery-powered devices energy, but
+    /// needs BlueZ's advertisement monitor support and misses devices that
+    /// advertise without flags.
     #[cfg(target_os = "linux")]
     #[arg(long, env = "BLEPROXY_SCAN_MODE", value_enum, default_value_t)]
-    scan_mode: bleproxy::bluez::ScanMode,
+    scan_mode: ScanModeArg,
 
     /// Address and port for the ESPHome API.
     #[arg(long, env = "BLEPROXY_LISTEN", default_value = "0.0.0.0:6053")]
@@ -60,6 +61,27 @@ struct Cli {
     /// Log level: off, error, warn, info, debug or trace.
     #[arg(long, env = "BLEPROXY_LOG", default_value = "info")]
     log_level: LevelFilter,
+}
+
+/// Command-line spelling of [`bleproxy_core::scanner::ScanMode`].
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+enum ScanModeArg {
+    /// Send scan requests.
+    #[default]
+    Active,
+    /// Listen only.
+    Passive,
+}
+
+#[cfg(target_os = "linux")]
+impl From<ScanModeArg> for bleproxy_core::scanner::ScanMode {
+    fn from(mode: ScanModeArg) -> Self {
+        match mode {
+            ScanModeArg::Active => Self::Active,
+            ScanModeArg::Passive => Self::Passive,
+        }
+    }
 }
 
 #[tokio::main]
@@ -88,32 +110,33 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let (advertisements, _) = broadcast::channel(1024);
 
     #[cfg(target_os = "linux")]
-    let bluetooth_mac = {
+    let (bluetooth_mac, scanner) = {
         let address = bleproxy::bluez::adapter_address(&cli.adapter)
             .await
             .map_err(|err| format!("cannot use Bluetooth adapter {}: {err}", cli.adapter))?;
         info!(adapter = cli.adapter, %address, "using Bluetooth adapter");
+        let (handle, driver) = bleproxy::scanner::channel(cli.scan_mode.into());
         tokio::spawn(bleproxy::bluez::scan_forever(
             cli.adapter.clone(),
-            cli.scan_mode,
+            driver,
             advertisements.clone(),
         ));
-        address
+        (address, Some(handle))
     };
     #[cfg(not(target_os = "linux"))]
-    let bluetooth_mac = {
+    let (bluetooth_mac, scanner) = {
         tracing::warn!(
             "Bluetooth scanning is not supported on this platform yet; serving the API only"
         );
-        bleproxy::identity::derived_mac(cli.name.as_deref().unwrap_or("bleproxy"))
+        let address = bleproxy::identity::derived_mac(cli.name.as_deref().unwrap_or("bleproxy"));
+        (address, None::<bleproxy::scanner::ScannerHandle>)
     };
     let mac = cli.mac.unwrap_or(bluetooth_mac);
-    let identity = Arc::new(Identity::new(
-        cli.name,
-        cli.friendly_name,
-        mac,
-        bluetooth_mac,
-    )?);
+    let mut identity = Identity::new(cli.name, cli.friendly_name, mac, bluetooth_mac)?;
+    if let Some(scanner) = &scanner {
+        identity = identity.with_scanner(scanner.configured());
+    }
+    let identity = Arc::new(identity);
 
     let listener = TcpListener::bind(cli.listen).await?;
     let address = listener.local_addr()?;
@@ -132,7 +155,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Some(announcement)
     };
 
-    let served = server::serve(listener, identity, advertisements, shutdown_signal()).await;
+    let context = server::Context {
+        identity,
+        advertisements,
+        scanner,
+    };
+    let served = server::serve(listener, context, shutdown_signal()).await;
     info!("shutting down");
     if let Some(announcement) = announcement {
         tokio::task::spawn_blocking(|| announcement.stop()).await?;

@@ -16,14 +16,20 @@
 //!   passive scanner, the ones used here match the common Flags values,
 //!   so devices that advertise without flags go unseen. It needs a BlueZ
 //!   with the `AdvertisementMonitor` API enabled.
+//!
+//! API clients can switch between them at runtime (see
+//! [`crate::scanner`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
+use bleproxy_core::scanner::{ScanMode, ScannerState};
 use bleproxy_core::{AddressType, AdvDataBuilder, Advertisement, BdAddr, Uuid};
 use futures_util::StreamExt;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
+
+use crate::scanner::ScannerDriver;
 use zbus::message::Type as MessageType;
 use zbus::{Connection, MatchRule, MessageStream, OwnedObjectPath, OwnedVariant, Variant};
 
@@ -37,17 +43,6 @@ const MONITOR_MANAGER: &str = "org.bluez.AdvertisementMonitorManager1";
 /// Where the passive scan's advertisement monitor is served.
 const MONITOR_ROOT: &str = "/io/github/fiam/bleproxy";
 const MONITOR_PATH: &str = "/io/github/fiam/bleproxy/monitor0";
-
-/// How BlueZ looks for advertisements.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum ScanMode {
-    /// Discovery with scan requests: sees every device and its scan
-    /// response data.
-    #[default]
-    Active,
-    /// Listen only, through an advertisement monitor.
-    Passive,
-}
 
 /// How long to wait before restarting a failed scan.
 const RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -101,33 +96,45 @@ pub async fn adapter_address(adapter: &str) -> Result<BdAddr, BluezError> {
 
 /// Scans with `adapter` forever, publishing advertisements to `sender`.
 ///
+/// Scans in the mode requested through `driver`, switching when another
+/// mode is requested, and reports the scanner's state back through it.
 /// Failures (BlueZ restarting, the adapter disappearing) are logged and the
 /// scan is restarted after a short delay.
 pub async fn scan_forever(
     adapter: String,
-    mode: ScanMode,
+    mut driver: ScannerDriver,
     sender: broadcast::Sender<Advertisement>,
 ) {
     loop {
-        match scan(&adapter, mode, &sender).await {
-            Ok(()) => warn!("scan ended unexpectedly"),
-            Err(err) => warn!(%err, "scan failed"),
+        let mode = driver.requested_mode();
+        driver.report(ScannerState::Starting, mode);
+        match scan(&adapter, mode, &sender, &mut driver).await {
+            Ok(next) => {
+                info!(from = ?mode, to = ?next, "switching scan mode");
+                continue;
+            }
+            Err(err) => {
+                warn!(%err, "scan failed");
+                driver.report(ScannerState::Failed, mode);
+            }
         }
         info!(delay = ?RETRY_DELAY, "restarting the scan");
-        tokio::time::sleep(RETRY_DELAY).await;
+        // Retry after a delay, or right away in another mode if asked to.
+        tokio::select! {
+            () = tokio::time::sleep(RETRY_DELAY) => {}
+            _ = driver.mode_change(mode) => {}
+        }
     }
 }
 
-/// Runs one scan session until the connection to BlueZ fails.
-///
-/// # Errors
-///
-/// Returns an error if BlueZ is unreachable or rejects the scan.
-pub async fn scan(
+/// Runs one scan session in `mode` until another mode is requested, which
+/// it returns, or until the connection to BlueZ fails.
+async fn scan(
     adapter: &str,
     mode: ScanMode,
     sender: &broadcast::Sender<Advertisement>,
-) -> Result<(), BluezError> {
+    driver: &mut ScannerDriver,
+) -> Result<ScanMode, BluezError> {
     let connection = Connection::system().await?;
     let path = adapter_path(adapter);
 
@@ -142,6 +149,7 @@ pub async fn scan(
         ScanMode::Passive => register_monitor(&connection, &path).await?,
     }
     info!(adapter, ?mode, "scanning");
+    driver.report(ScannerState::Running, mode);
 
     let mut devices = Devices::new(&path);
     let objects: ManagedObjects = connection
@@ -166,6 +174,12 @@ pub async fn scan(
             Some(message) = changed.next() => (message?, Signal::Changed),
             Some(message) = added.next() => (message?, Signal::Added),
             Some(message) = removed.next() => (message?, Signal::Removed),
+            next = driver.mode_change(mode) => {
+                driver.report(ScannerState::Stopping, mode);
+                stop(&connection, &path, mode).await;
+                driver.report(ScannerState::Stopped, mode);
+                return Ok(next);
+            }
             else => return Err(BluezError::Disconnected),
         };
         let Some(object) = message
@@ -261,6 +275,35 @@ async fn start_discovery(connection: &Connection, path: &str) -> Result<(), Blue
 
 /// Serves an advertisement monitor and registers it with the adapter,
 /// which makes BlueZ scan passively for it.
+/// Stops scanning in `mode`. Best effort: BlueZ also stops when our bus
+/// connection closes, which follows right after.
+async fn stop(connection: &Connection, path: &str, mode: ScanMode) {
+    let result = match mode {
+        ScanMode::Active => {
+            connection
+                .call_method(Some(BLUEZ), path, Some(ADAPTER), "StopDiscovery", &())
+                .await
+        }
+        ScanMode::Passive => match zbus::ObjectPath::try_from(MONITOR_ROOT) {
+            Ok(root) => {
+                connection
+                    .call_method(
+                        Some(BLUEZ),
+                        path,
+                        Some(MONITOR_MANAGER),
+                        "UnregisterMonitor",
+                        &(root,),
+                    )
+                    .await
+            }
+            Err(err) => Err(err),
+        },
+    };
+    if let Err(err) = result {
+        debug!(%err, ?mode, "stopping the scan failed");
+    }
+}
+
 async fn register_monitor(connection: &Connection, path: &str) -> Result<(), BluezError> {
     let server = connection.object_server();
     server.at(MONITOR_ROOT, zbus::fdo::ObjectManager).await?;

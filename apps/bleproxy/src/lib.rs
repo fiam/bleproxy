@@ -8,6 +8,7 @@
 pub mod bluez;
 pub mod identity;
 pub mod mdns;
+pub mod scanner;
 pub mod server;
 
 pub use identity::Identity;

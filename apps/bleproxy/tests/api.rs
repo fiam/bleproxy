@@ -6,7 +6,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bleproxy::scanner::{self, ScannerDriver, ScannerHandle};
 use bleproxy::{Identity, server};
+use bleproxy_core::scanner::{ScanMode, ScannerState};
 use bleproxy_core::{AddressType, AdvData, Advertisement, BdAddr};
 use bleproxy_protocol::FrameHeader;
 use bleproxy_protocol::wire::{Field, Fields, Value};
@@ -27,19 +29,33 @@ struct Proxy {
 
 impl Proxy {
     async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// Starts a proxy with a switchable scanner, returning the driver the
+    /// test plays the scanner with.
+    async fn start_with_scanner(configured: ScanMode) -> (Self, ScannerDriver) {
+        let (handle, driver) = scanner::channel(configured);
+        (Self::start_with(Some(handle)).await, driver)
+    }
+
+    async fn start_with(scanner: Option<ScannerHandle>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("local address");
-        let identity = Arc::new(Identity::new(None, None, MAC, MAC).expect("identity"));
+        let mut identity = Identity::new(None, None, MAC, MAC).expect("identity");
+        if let Some(scanner) = &scanner {
+            identity = identity.with_scanner(scanner.configured());
+        }
         let (advertisements, _) = broadcast::channel(64);
         let (shutdown, stopped) = oneshot::channel::<()>();
-        tokio::spawn(server::serve(
-            listener,
-            identity,
-            advertisements.clone(),
-            async move {
-                let _ = stopped.await;
-            },
-        ));
+        let context = server::Context {
+            identity: Arc::new(identity),
+            advertisements: advertisements.clone(),
+            scanner,
+        };
+        tokio::spawn(server::serve(listener, context, async move {
+            let _ = stopped.await;
+        }));
         let client = TcpStream::connect(address).await.expect("connect");
         Self {
             client,
@@ -164,6 +180,46 @@ async fn forwards_advertisements_to_subscribers() {
     assert_eq!(entry[1].as_u32(), Ok(139), "zigzag(-70)");
     assert_eq!(entry[2].as_u32(), Ok(1));
     assert_eq!(entry[3].as_bytes(), Ok(&[0x02, 0x01, 0x06][..]));
+}
+
+fn uint_fields(payload: &[u8]) -> Vec<(u32, u32)> {
+    fields(payload)
+        .iter()
+        .map(|field| (field.number, field.as_u32().expect("uint")))
+        .collect()
+}
+
+#[tokio::test]
+async fn reports_scanner_state_and_switches_modes() {
+    let (mut proxy, mut driver) = Proxy::start_with_scanner(ScanMode::Active).await;
+    proxy.hello().await;
+
+    proxy.send(9, &[]).await;
+    let (_, info) = proxy.receive().await;
+    let flags = fields(&info)
+        .iter()
+        .find(|field| field.number == 15)
+        .map(|field| field.as_u32().expect("flags"));
+    assert_eq!(flags, Some(0b110_0001), "STATE_AND_MODE is offered");
+
+    // Subscribing reports the current state: idle, active, configured active.
+    proxy.send(66, &[0x08, 0x01]).await;
+    let (message_type, state) = proxy.receive().await;
+    assert_eq!(message_type, 126, "BluetoothScannerStateResponse");
+    assert_eq!(uint_fields(&state), [(2, 1), (3, 1)]);
+
+    // BluetoothScannerSetModeRequest { mode: PASSIVE } reaches the scanner.
+    proxy.send(127, &[]).await;
+    let requested = timeout(DEADLINE, driver.mode_change(ScanMode::Active))
+        .await
+        .expect("mode request");
+    assert_eq!(requested, ScanMode::Passive);
+
+    // Status changes are pushed to the subscriber.
+    driver.report(ScannerState::Running, ScanMode::Passive);
+    let (message_type, state) = proxy.receive().await;
+    assert_eq!(message_type, 126);
+    assert_eq!(uint_fields(&state), [(1, 2), (3, 1)], "running, passive");
 }
 
 #[tokio::test]

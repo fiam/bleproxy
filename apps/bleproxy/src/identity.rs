@@ -1,6 +1,7 @@
 //! How the proxy identifies itself to Home Assistant.
 
 use bleproxy_core::BdAddr;
+use bleproxy_core::scanner::ScanMode;
 use bleproxy_core::session::DeviceIdentity;
 
 /// Maximum length of a device name, as limited by the ESPHome API.
@@ -27,6 +28,7 @@ pub struct Identity {
     bluetooth_mac_address: String,
     model: String,
     server_info: String,
+    scanner: Option<ScanMode>,
 }
 
 impl Identity {
@@ -68,7 +70,16 @@ impl Identity {
             bluetooth_mac_address: bluetooth_mac.to_string(),
             model: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
             server_info: format!("bleproxy {}", Self::VERSION),
+            scanner: None,
         })
+    }
+
+    /// Declares a scanner configured with `mode` whose mode clients may
+    /// change.
+    #[must_use]
+    pub const fn with_scanner(mut self, mode: ScanMode) -> Self {
+        self.scanner = Some(mode);
+        self
     }
 
     /// Device name, which is also the mDNS host name.
@@ -108,7 +119,7 @@ impl Identity {
             project_name: Self::PROJECT_NAME,
             version: Self::VERSION,
             server_info: &self.server_info,
-            scanner: None,
+            scanner: self.scanner,
         }
     }
 }

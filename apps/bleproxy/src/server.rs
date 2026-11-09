@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bleproxy_core::Advertisement;
-use bleproxy_core::session::Session;
+use bleproxy_core::scanner::ScannerStatus;
+use bleproxy_core::session::{Reply, Session};
 use bleproxy_protocol::wire::{DecodeError, EncodeError};
 use bleproxy_protocol::{
     BluetoothLeRawAdvertisementsResponse, ClientMessage, FrameError, FrameHeader, RawAdvertisement,
@@ -15,11 +16,12 @@ use bleproxy_protocol::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::Identity;
+use crate::scanner::ScannerHandle;
 
 /// Largest client message payload accepted, in bytes. Clients only send
 /// small requests, so anything bigger is a broken or hostile peer.
@@ -60,18 +62,28 @@ pub enum ConnectionError {
     Encode(#[from] EncodeError),
 }
 
+/// What every connection shares.
+#[derive(Debug, Clone)]
+pub struct Context {
+    /// How the proxy identifies itself.
+    pub identity: Arc<Identity>,
+    /// Advertisements to forward to subscribed clients.
+    pub advertisements: broadcast::Sender<Advertisement>,
+    /// The scanner, if clients may follow its state and switch its mode.
+    pub scanner: Option<ScannerHandle>,
+}
+
 /// Accepts API connections on `listener` until `shutdown` completes.
 ///
-/// Each connection gets its own task. Advertisements published on
-/// `advertisements` are forwarded to every client that subscribed to them.
+/// Each connection gets its own task. Advertisements published on the
+/// context's channel are forwarded to every client that subscribed to them.
 ///
 /// # Errors
 ///
 /// Returns an error if accepting connections fails.
 pub async fn serve(
     listener: TcpListener,
-    identity: Arc<Identity>,
-    advertisements: broadcast::Sender<Advertisement>,
+    context: Context,
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
     tokio::pin!(shutdown);
@@ -80,12 +92,11 @@ pub async fn serve(
             accepted = listener.accept() => accepted?,
             () = &mut shutdown => return Ok(()),
         };
-        let identity = Arc::clone(&identity);
-        let advertisements = advertisements.clone();
+        let context = context.clone();
         tokio::spawn(
             async move {
                 info!("client connected");
-                match handle_connection(stream, &identity, &advertisements).await {
+                match handle_connection(stream, &context).await {
                     Ok(()) => info!("client disconnected"),
                     Err(err) => warn!(%err, "client connection failed"),
                 }
@@ -103,13 +114,13 @@ pub async fn serve(
 /// protocol.
 pub async fn handle_connection(
     stream: TcpStream,
-    identity: &Identity,
-    advertisements: &broadcast::Sender<Advertisement>,
+    context: &Context,
 ) -> Result<(), ConnectionError> {
     stream.set_nodelay(true)?;
     let (mut reader, mut writer) = stream.into_split();
-    let device = identity.device_identity();
+    let device = context.identity.device_identity();
     let mut session = Session::new(&device);
+    let mut scanner_status = context.scanner.as_ref().map(ScannerHandle::status);
 
     let mut inbox = Vec::with_capacity(1024);
     let mut out = vec![0; OUTPUT_BUFFER_LEN];
@@ -135,8 +146,11 @@ pub async fn handle_connection(
                     let outcome = session.handle(&message);
                     inbox.drain(..consumed);
                     if let Some(reply) = outcome.reply {
-                        let len = reply.encode_frame(&mut out)?;
-                        writer.write_all(out.get(..len).unwrap_or_default()).await?;
+                        send_reply(&mut writer, &reply, &mut out).await?;
+                    }
+                    if let (Some(mode), Some(scanner)) = (outcome.scan_mode, &context.scanner) {
+                        info!(?mode, "client requested a scan mode");
+                        scanner.request(mode);
                     }
                     if outcome.close {
                         writer.shutdown().await?;
@@ -145,7 +159,17 @@ pub async fn handle_connection(
                 }
                 // Follow subscription changes made by the messages above.
                 match (&subscription, session.wants_raw_advertisements()) {
-                    (None, true) => subscription = Some(advertisements.subscribe()),
+                    (None, true) => {
+                        subscription = Some(context.advertisements.subscribe());
+                        // Like ESPHome, report the scanner's state to new
+                        // subscribers, then follow its changes.
+                        if let Some(status) = &mut scanner_status {
+                            let current = *status.borrow_and_update();
+                            if let Some(reply) = session.scanner_state(current) {
+                                send_reply(&mut writer, &reply, &mut out).await?;
+                            }
+                        }
+                    }
                     (Some(_), false) => {
                         subscription = None;
                         batch.clear();
@@ -165,6 +189,11 @@ pub async fn handle_connection(
                 }
                 Err(broadcast::error::RecvError::Closed) => subscription = None,
             },
+            Some(status) = status_change(&mut scanner_status), if subscription.is_some() => {
+                if let Some(reply) = session.scanner_state(status) {
+                    send_reply(&mut writer, &reply, &mut out).await?;
+                }
+            }
             _ = flush.tick(), if !batch.is_empty() => {
                 send_batch(&mut writer, &mut batch, &mut out).await?;
             }
@@ -174,6 +203,29 @@ pub async fn handle_connection(
             }
         }
     }
+}
+
+/// Waits for the scanner's status to change. Never completes without a
+/// scanner, or once the scanner is gone.
+async fn status_change(
+    status: &mut Option<watch::Receiver<ScannerStatus>>,
+) -> Option<ScannerStatus> {
+    if let Some(receiver) = status
+        && receiver.changed().await.is_ok()
+    {
+        return Some(*receiver.borrow_and_update());
+    }
+    std::future::pending().await
+}
+
+async fn send_reply(
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    reply: &Reply<'_>,
+    out: &mut [u8],
+) -> Result<(), ConnectionError> {
+    let len = reply.encode_frame(out)?;
+    writer.write_all(out.get(..len).unwrap_or_default()).await?;
+    Ok(())
 }
 
 /// Receives from `subscription`, or waits forever without one.
