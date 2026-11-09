@@ -14,7 +14,7 @@ Windows, macOS) and microcontrollers (ESP32-C3, ESP32-S3).
 | --- | --- | --- |
 | `crates/bleproxy-core` | BLE domain types, proxy logic | `no_std`, `forbid(unsafe_code)`, no I/O |
 | `crates/bleproxy-protocol` | ESPHome wire format | `no_std`, `forbid(unsafe_code)`, no I/O, no allocation in codecs |
-| `apps/bleproxy` | host app on Tokio: API server, transports (plain, Noise), mDNS, scanner control, BlueZ (Linux) | platform code lives here; lib + thin bin |
+| `apps/bleproxy` | host app on Tokio: API server, transports (plain, Noise), mDNS, scanner and connection control, BlueZ (Linux) | platform code lives here; lib + thin bin |
 | `apps/bleproxy-esp32` | firmware (esp-hal, esp-rtos, Embassy) | not in `default-members`; built via `cargo xtask esp32` |
 | `xtask` | task runner (std only) | no dependencies |
 | `docker/` | test images for `cargo xtask docker` | |
@@ -29,12 +29,12 @@ cargo xtask ci                  # all host checks: fmt, metadata, clippy, msrv, 
 cargo xtask test                # just the tests
 cargo xtask docker windows      # tests for Windows under Wine (also linux-amd64, linux-arm64)
 cargo xtask esp32 [esp32s3]     # firmware lint and build; S3 needs `. ~/export-esp.sh`
-cargo xtask e2e                 # mock BlueZ + bleproxy + aioesphomeapi: scan modes, switching, encryption
+cargo xtask e2e                 # mock BlueZ + bleproxy + aioesphomeapi: scanning, encryption, GATT
 ```
 
 **Definition of done:** `cargo xtask ci` passes. If you touched platform
 code, the relevant `docker`, `e2e` or `esp32` task passes too. Linux-only
-code (`apps/bleproxy/src/bluez.rs`) can be linted from other hosts with
+code (`apps/bleproxy/src/bluez.rs` and `bluez/`) can be linted from other hosts with
 `cargo clippy --target aarch64-unknown-linux-gnu --all-targets`.
 
 ## Rules
@@ -103,6 +103,10 @@ code (`apps/bleproxy/src/bluez.rs`) can be linted from other hosts with
   image (the image runs as `nobody`). The image must also set
   `DBUS_SYSTEM_BUS_ADDRESS`, since distroless lacks `/var/run`. The e2e test
   runs a real system bus with BlueZ's policy to catch regressions here.
+- BlueZ differs from ESPHome in ways clients notice: it refuses writes to
+  the client characteristic configuration descriptor, and a read changes a
+  characteristic's `Value` just like a notification does. `bluez/gatt.rs`
+  documents how the proxy hides this; the e2e mock reproduces both.
 - Wire compatibility is checked against aioesphomeapi, Home Assistant's
   client: protobuf test vectors come from its generated classes, and the e2e
   test drives the real binary with it. Encryption mismatches must produce the

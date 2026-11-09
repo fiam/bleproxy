@@ -17,6 +17,8 @@ services:
       # BLEPROXY_NAME: bleproxy-garage
       # BLEPROXY_FRIENDLY_NAME: Garage
       # BLEPROXY_ADAPTER: hci0
+      # Devices Home Assistant may connect to at once (0 turns it off).
+      # BLEPROXY_CONNECTION_SLOTS: "3"
       # Encrypt the API; Home Assistant asks for this key when adding the
       # proxy. Generate one with `openssl rand -base64 32`. To keep it out
       # of the environment, use BLEPROXY_ENCRYPTION_KEY_FILE with a file

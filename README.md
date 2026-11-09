@@ -16,11 +16,11 @@ $5 ESP32, all speaking the [ESPHome Native API][esphome-api].
 
 > [!NOTE]
 > **Early, but working on Linux.** On a Linux host with BlueZ, bleproxy
-> already acts as a passive Bluetooth proxy for Home Assistant: it is
-> discovered automatically, forwards advertisements, lets Home Assistant
-> switch between active and passive scanning, and supports ESPHome's API
-> encryption. Active connections (GATT) and Bluetooth scanning on Windows,
-> macOS and ESP32 are still to come. See the [roadmap](#roadmap).
+> already acts as a Bluetooth proxy for Home Assistant: it is discovered
+> automatically, forwards advertisements, connects to devices for the
+> integrations that need it, lets Home Assistant switch between active and
+> passive scanning, and supports ESPHome's API encryption. Bluetooth on
+> Windows, macOS and ESP32 is still to come. See the [roadmap](#roadmap).
 
 ## Why
 
@@ -50,7 +50,7 @@ flowchart LR
         radio --> core --> api
     end
     ha["Home Assistant<br/>ESPHome integration"]
-    sensors -- advertisements --> radio
+    sensors <-- "advertisements, connections" --> radio
     api <-->|"TCP 6053"| ha
 ```
 
@@ -58,7 +58,7 @@ flowchart LR
 
 | Target | Binary | Status | BLE backend |
 | --- | --- | --- | --- |
-| Linux (x86_64, aarch64) | `bleproxy` | ✅ passive proxy | BlueZ over D-Bus (active or passive scanning) |
+| Linux (x86_64, aarch64) | `bleproxy` | ✅ scanning and active connections | BlueZ over D-Bus |
 | Windows (x86_64) | `bleproxy` | 🏗️ API only, no scanning yet | WinRT (planned) |
 | macOS (Apple silicon) | `bleproxy` | 🏗️ API only, no scanning yet | CoreBluetooth (planned) |
 | ESP32-C3 (RISC-V) | `bleproxy-esp32` | 🏗️ boots, prints banner | [TrouBLE] + esp-radio (planned) |
@@ -117,6 +117,8 @@ address and port 6053, and leave the encryption key empty.
 
 Once added, the proxy shows up under **Settings → Bluetooth** as a remote
 scanner, and Bluetooth devices near the server appear in Home Assistant.
+Integrations that talk to devices rather than only listening (locks, lights,
+some sensors) connect to them through the proxy too.
 
 ### Configuration
 
@@ -128,6 +130,7 @@ Every option is a command-line flag and a `BLEPROXY_*` environment variable:
 | `--friendly-name` | `BLEPROXY_FRIENDLY_NAME` | `bleproxy <MAC SUFFIX>` | Name shown in Home Assistant |
 | `--adapter` | `BLEPROXY_ADAPTER` | `hci0` | Bluetooth adapter to scan with |
 | `--scan-mode` | `BLEPROXY_SCAN_MODE` | `active` | Scan mode to start in: `active` or `passive` (see below) |
+| `--connection-slots` | `BLEPROXY_CONNECTION_SLOTS` | `3` | Devices Home Assistant may connect to at once; `0` turns connections off |
 | `--encryption-key` | `BLEPROXY_ENCRYPTION_KEY` | none | Base64 key that encrypts the API (see below) |
 | `--encryption-key-file` | `BLEPROXY_ENCRYPTION_KEY_FILE` | none | File holding that key, to keep it out of the environment |
 | `--mac` | `BLEPROXY_MAC` | the adapter's address | Address identifying the proxy in Home Assistant |
@@ -144,6 +147,15 @@ flags are not seen, and it needs a BlueZ with the advertisement monitor API
 (older releases only enable it with `bluetoothd --experimental`).
 `--scan-mode` only sets the starting mode: Home Assistant shows the scanner's
 state and can switch modes at runtime, like with ESPHome proxies.
+
+**Active connections.** Home Assistant connects to devices through the proxy
+when an integration needs to read from or control them. Each connected device
+takes a slot, and Home Assistant spreads connections over the proxies with
+free slots. The default of 3 matches ESPHome; most adapters handle a few more,
+so raise `--connection-slots` if connections queue up, or set it to `0` to
+only forward advertisements. bleproxy uses BlueZ's own connections, so
+devices connected through the proxy also show up as connected in
+`bluetoothctl`, and BlueZ's pairing data applies.
 
 **Encryption.** With a key, the API is encrypted exactly like an ESPHome
 device with `api: encryption: key:` (Noise, with a pre-shared key). Home
@@ -175,6 +187,10 @@ Home Assistant.
   `bluetoothd` runs and, in Docker, that `/run/dbus` is mounted.
 - **Not discovered:** mDNS must reach Home Assistant (same network or VLAN
   reflector, port 5353/udp open), or add the device by hand.
+- **Devices don't connect:** check the log for the BlueZ error. The device
+  must be in range of the server's adapter, and BlueZ must have seen it
+  recently, unless `bluetoothd` runs with `--experimental`, which lets
+  bleproxy connect to devices by address.
 - **Invalid encryption key / connection requires encryption:** the key in
   Home Assistant doesn't match the proxy's, or only one side has one.
   Reconfigure the device in Home Assistant with the proxy's key.
@@ -220,14 +236,14 @@ The split follows one rule: **shared crates never touch hardware or
 sockets.**
 
 - **`bleproxy-protocol`** owns the wire format: plaintext and Noise frames
-  and the protobuf messages a passive Bluetooth proxy exchanges, encoded and
+  and the protobuf messages a Bluetooth proxy exchanges, encoded and
   decoded without allocating into caller-provided buffers. It is `#![no_std]`, so the
   same code can serve a Tokio socket and an Embassy TCP stack.
 - **`bleproxy-core`** owns the proxy's behavior: device addresses, UUIDs and
   advertisements (in fixed-size buffers, so the scan path never allocates),
   rebuilding advertising data from parsed fields, scan modes and scanner
   states, and the API `Session`, a sans-I/O state machine that turns client
-  messages into replies and scan mode requests. It is
+  messages into replies, scan mode requests and connection requests. It is
   `#![no_std]` and forbids `unsafe`.
 - **`apps/bleproxy`** is the I/O around them, on Tokio:
   - `server` accepts API connections, drives a `Session` per client and
@@ -236,9 +252,11 @@ sockets.**
     encryption (via [snow]), including the handshake.
   - `scanner` links connections to the scanner task: mode requests one way,
     state the other.
+  - `connections` links them to the connection manager: requests one way,
+    results, notifications and free slots the other.
   - `mdns` announces the proxy like an ESPHome device.
-  - `bluez` (Linux) follows BlueZ over D-Bus and publishes advertisements on
-    a broadcast channel.
+  - `bluez` (Linux) follows BlueZ over D-Bus, publishes advertisements on
+    a broadcast channel, and connects to devices for clients.
 
   It is a library plus a thin binary, so integration tests drive the server
   directly.
@@ -315,6 +333,9 @@ in both scan modes:
 - aioesphomeapi, the client library Home Assistant uses, checks the device
   info, that new and updated devices arrive as the expected raw
   advertisements, the reported scanner state and switching modes at runtime.
+- The mock exports a GATT database like bluetoothd, and the client connects
+  through bleproxy, lists services, reads, writes, subscribes to
+  notifications and disconnects, checking BlueZ's quirks along the way.
 - A third run does the same over an encrypted connection, and checks that
   clients with a wrong key, or none, are rejected with the errors Home
   Assistant expects.
@@ -394,7 +415,7 @@ Releases are fully automated with [release-please]:
 - [x] Firmware boots on ESP32-C3 and ESP32-S3
 - [x] Scanner state and mode switching from Home Assistant
 - [x] Noise encryption (ESPHome API encryption keys)
-- [ ] Active connections (GATT proxying)
+- [x] Active connections (GATT proxying) on Linux
 - [ ] Windows and macOS backends
 - [ ] BLE scanning on ESP32 via esp-radio and TrouBLE
 
