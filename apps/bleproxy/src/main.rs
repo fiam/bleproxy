@@ -51,6 +51,13 @@ struct Cli {
     #[arg(long, env = "BLEPROXY_SCAN_MODE", value_enum, default_value_t)]
     scan_mode: ScanModeArg,
 
+    /// How many devices Home Assistant may connect to through the proxy at
+    /// once, for integrations that read from or control devices. 0 turns
+    /// active connections off.
+    #[cfg(target_os = "linux")]
+    #[arg(long, env = "BLEPROXY_CONNECTION_SLOTS", default_value_t = 3)]
+    connection_slots: u32,
+
     /// Key that encrypts the API, as 32 bytes of base64 (ESPHome's
     /// `api: encryption: key:`). Generate one with
     /// `openssl rand -base64 32`; Home Assistant asks for it when adding the
@@ -138,7 +145,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let (advertisements, _) = broadcast::channel(1024);
 
     #[cfg(target_os = "linux")]
-    let (bluetooth_mac, scanner) = {
+    let (bluetooth_mac, scanner, connections) = {
         let address = bleproxy::bluez::adapter_address(&cli.adapter)
             .await
             .map_err(|err| format!("cannot use Bluetooth adapter {}: {err}", cli.adapter))?;
@@ -149,20 +156,35 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             driver,
             advertisements.clone(),
         ));
-        (address, Some(handle))
+        let connections = (cli.connection_slots > 0).then(|| {
+            let (handle, driver) = bleproxy::connections::channel(cli.connection_slots);
+            tokio::spawn(bleproxy::bluez::manage_connections(
+                cli.adapter.clone(),
+                driver,
+            ));
+            handle
+        });
+        (address, Some(handle), connections)
     };
     #[cfg(not(target_os = "linux"))]
-    let (bluetooth_mac, scanner) = {
+    let (bluetooth_mac, scanner, connections) = {
         tracing::warn!(
             "Bluetooth scanning is not supported on this platform yet; serving the API only"
         );
         let address = bleproxy::identity::derived_mac(cli.name.as_deref().unwrap_or("bleproxy"));
-        (address, None::<bleproxy::scanner::ScannerHandle>)
+        (
+            address,
+            None::<bleproxy::scanner::ScannerHandle>,
+            None::<bleproxy::connections::ConnectionsHandle>,
+        )
     };
     let mac = cli.mac.unwrap_or(bluetooth_mac);
     let mut identity = Identity::new(cli.name, cli.friendly_name, mac, bluetooth_mac)?;
     if let Some(scanner) = &scanner {
         identity = identity.with_scanner(scanner.configured());
+    }
+    if connections.is_some() {
+        identity = identity.with_connections();
     }
     if encryption.is_some() {
         identity = identity.with_encryption();
@@ -192,7 +214,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         advertisements,
         scanner,
         encryption,
-        connections: None,
+        connections,
     };
     let served = server::serve(listener, context, shutdown_signal()).await;
     info!("shutting down");

@@ -88,13 +88,19 @@ def monitor_properties(bus, pid, root):
     )
     for name in names.ListNames():
         if name.startswith(":") and names.GetConnectionUnixProcessID(name) == pid:
+            # bleproxy has several bus connections; only the scanner's
+            # serves the monitor, and the others don't answer at all.
             manager = dbus.Interface(
-                bus.get_object(name, root), "org.freedesktop.DBus.ObjectManager"
+                bus.get_object(name, root, introspect=False),
+                "org.freedesktop.DBus.ObjectManager",
             )
-            objects = manager.GetManagedObjects()
+            try:
+                objects = manager.GetManagedObjects(timeout=2)
+            except dbus.exceptions.DBusException:
+                continue
             (interfaces,) = objects.values()
             return interfaces["org.bluez.AdvertisementMonitor1"]
-    raise AssertionError("bleproxy is not on the bus")
+    raise AssertionError("bleproxy's advertisement monitor is not on the bus")
 
 
 async def check_scanning_started(bus, mode, pid):
@@ -154,8 +160,9 @@ async def main(binary, mode, encrypted):
         assert info.project_name == "fiam.bleproxy", info
         assert info.api_encryption_supported == encrypted, info
         flags = info.bluetooth_proxy_feature_flags_compat(client.api_version)
-        # Passive scan, raw advertisements, and state and mode.
-        assert flags == 0b110_0001, flags
+        # Passive scan, active connections, remote caching, raw
+        # advertisements, and state and mode.
+        assert flags == 0b110_0111, flags
 
         states = []
         client.subscribe_bluetooth_scanner_state(states.append)

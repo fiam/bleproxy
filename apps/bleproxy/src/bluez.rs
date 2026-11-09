@@ -19,6 +19,13 @@
 //!
 //! API clients can switch between them at runtime (see
 //! [`crate::scanner`]).
+//!
+//! Connections to devices, for clients that proxy GATT through bleproxy,
+//! are handled by [`manage_connections`].
+
+mod gatt;
+
+pub use gatt::manage_connections;
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -65,6 +72,9 @@ pub enum BluezError {
     /// The signal streams ended, usually because the bus connection closed.
     #[error("lost the connection to BlueZ")]
     Disconnected,
+    /// The device disconnected before its services were resolved.
+    #[error("the device disconnected")]
+    ConnectionLost,
 }
 
 /// Properties of all D-Bus objects, as returned by `GetManagedObjects`.
