@@ -24,6 +24,7 @@ from aioesphomeapi.model import (
     BluetoothScannerMode,
     BluetoothScannerState,
     EntityCategory,
+    LogLevel,
     SensorInfo,
     SensorState,
     SensorStateClass,
@@ -389,6 +390,38 @@ async def check_scanning_switch(client, bus, mode, switch, states, scanner_state
     )
 
 
+async def check_logs(key):
+    """Subscribed clients get the configuration, then the proxy's logs."""
+    step("streaming logs")
+    client = await connect(key)
+    lines = []
+    client.subscribe_logs(
+        lambda response: lines.append((response.level, response.message.decode())),
+        log_level=LogLevel.LOG_LEVEL_INFO,
+        dump_config=True,
+    )
+    await wait_for(
+        lines,
+        lambda line: line == (LogLevel.LOG_LEVEL_CONFIG, "[C][bleproxy]: Encryption: "
+        + ("on" if key else "off")),
+        "the configuration",
+    )
+    seen = len(lines)
+    other = await connect(key)
+    await wait_for_new(
+        lines,
+        seen,
+        lambda line: line[0] == LogLevel.LOG_LEVEL_INFO
+        and line[1].startswith("[I][server]: connection{peer=127.0.0.1:")
+        and line[1].endswith("client connected"),
+        "the other client's connection",
+    )
+    # bleproxy logs at debug here, but this client asked for info.
+    assert all(level <= LogLevel.LOG_LEVEL_INFO for level, _ in lines[seen:]), lines
+    await other.disconnect()
+    await client.disconnect()
+
+
 def start_proxy(binary, mode, env):
     step("starting bleproxy")
     # Unprivileged, as in deployments: the bus policy must let it in.
@@ -490,6 +523,7 @@ async def main(binary, mode, encrypted, filtered):
         # advertisements, and state and mode.
         assert flags == 0b110_0111, flags
         switch, entity_states = await check_entities(client)
+        await check_logs(key)
 
         states = []
         client.subscribe_bluetooth_scanner_state(states.append)
