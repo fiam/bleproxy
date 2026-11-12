@@ -7,13 +7,15 @@
     reason = "test helpers should fail loudly"
 )]
 
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bleproxy::connections::{
     self, Characteristic, Command, ConnectionsDriver, ConnectionsHandle, Descriptor, Event, Service,
 };
 use bleproxy::filter::AddressFilter;
+use bleproxy::logs::Logs;
 use bleproxy::scanner::{self, ScannerDriver, ScannerHandle};
 use bleproxy::{Identity, server};
 use bleproxy_core::Uuid;
@@ -31,6 +33,7 @@ const MAC: BdAddr = BdAddr::new([0x02, 0x11, 0x22, 0xA1, 0xB2, 0xC3]);
 const DEADLINE: Duration = Duration::from_secs(5);
 
 struct Proxy {
+    address: SocketAddr,
     client: TcpStream,
     advertisements: broadcast::Sender<Advertisement>,
     inbox: Vec<u8>,
@@ -39,26 +42,33 @@ struct Proxy {
 
 impl Proxy {
     async fn start() -> Self {
-        Self::start_with(None, None).await
+        Self::start_with(None, None, Arc::default()).await
     }
 
     /// Starts a proxy with a switchable scanner, returning the driver the
     /// test plays the scanner with.
     async fn start_with_scanner(configured: ScanMode) -> (Self, ScannerDriver) {
         let (handle, driver) = scanner::channel(configured);
-        (Self::start_with(Some(handle), None).await, driver)
+        (
+            Self::start_with(Some(handle), None, Arc::default()).await,
+            driver,
+        )
     }
 
     /// Starts a proxy that offers connections, returning the driver the
     /// test plays the connection manager with.
     async fn start_with_connections(limit: u32) -> (Self, ConnectionsDriver) {
         let (handle, driver) = connections::channel(limit, AddressFilter::default());
-        (Self::start_with(None, Some(handle)).await, driver)
+        (
+            Self::start_with(None, Some(handle), Arc::default()).await,
+            driver,
+        )
     }
 
     async fn start_with(
         scanner: Option<ScannerHandle>,
         connections: Option<ConnectionsHandle>,
+        logs: Arc<Logs>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("local address");
@@ -78,12 +88,15 @@ impl Proxy {
             diagnostics: Arc::default(),
             encryption: None,
             connections,
+            logs,
+            config: Arc::from(["Name: bleproxy-a1b2c3".to_owned()]),
         };
         tokio::spawn(server::serve(listener, context, async move {
             let _ = stopped.await;
         }));
         let client = TcpStream::connect(address).await.expect("connect");
         Self {
+            address,
             client,
             advertisements,
             inbox: Vec::new(),
@@ -301,6 +314,74 @@ async fn forwards_advertisements_to_subscribers() {
     assert_eq!(entry[1].as_u32(), Ok(139), "zigzag(-70)");
     assert_eq!(entry[2].as_u32(), Ok(1));
     assert_eq!(entry[3].as_bytes(), Ok(&[0x02, 0x01, 0x06][..]));
+}
+
+/// The logs every test's events go to. A global subscriber is the only
+/// way to see the server's events, which it logs from its own tasks.
+fn logs() -> Arc<Logs> {
+    static LOGS: OnceLock<Arc<Logs>> = OnceLock::new();
+    Arc::clone(LOGS.get_or_init(|| {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let logs = Arc::new(Logs::default());
+        let subscriber = tracing_subscriber::registry().with(logs.layer());
+        tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
+        logs
+    }))
+}
+
+/// Returns the level and text of a `SubscribeLogsResponse`.
+fn log_line(payload: &[u8]) -> (u32, String) {
+    let fields = fields(payload);
+    let level = fields
+        .iter()
+        .find(|field| field.number == 1)
+        .map_or(0, |field| field.as_u32().expect("level"));
+    let text = fields
+        .iter()
+        .find(|field| field.number == 3)
+        .map(|field| String::from_utf8(field.as_bytes().expect("bytes").to_vec()).expect("UTF-8"))
+        .unwrap_or_default();
+    (level, text)
+}
+
+#[tokio::test]
+async fn streams_logs_to_subscribers() {
+    let mut proxy = Proxy::start_with(None, None, logs()).await;
+    proxy.hello().await;
+
+    // SubscribeLogsRequest { level: INFO, dump_config: true } first gets
+    // the configuration.
+    proxy.send(28, &[0x08, 0x03, 0x10, 0x01]).await;
+    let (message_type, payload) = proxy.receive().await;
+    assert_eq!(message_type, 29, "SubscribeLogsResponse");
+    assert_eq!(
+        log_line(&payload),
+        (4, "[C][bleproxy]: Name: bleproxy-a1b2c3".to_owned())
+    );
+
+    // Then the server's events, such as another client connecting. Other
+    // tests' events may come first.
+    let _other = TcpStream::connect(proxy.address).await.expect("connect");
+    loop {
+        let (message_type, payload) = proxy.receive().await;
+        assert_eq!(message_type, 29, "SubscribeLogsResponse");
+        let (level, text) = log_line(&payload);
+        assert!(level <= 3, "only up to INFO: {text}");
+        if text.starts_with("[I][server]: connection{peer=") && text.ends_with("client connected") {
+            break;
+        }
+    }
+
+    // Level NONE ends the subscription.
+    proxy.send(28, &[]).await;
+    proxy.send(7, &[]).await;
+    loop {
+        match proxy.receive().await.0 {
+            8 => break,
+            message_type => assert_eq!(message_type, 29, "only lines sent before"),
+        }
+    }
 }
 
 fn hex(s: &str) -> Vec<u8> {

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use bleproxy::diagnostics::Diagnostics;
 use bleproxy::encryption::EncryptionKey;
 use bleproxy::identity::validate_name;
+use bleproxy::logs::Logs;
 use bleproxy::mdns::Announcement;
 use bleproxy::{Identity, server};
 use bleproxy_core::BdAddr;
@@ -18,6 +19,9 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tracing::level_filters::LevelFilter;
 use tracing::{error, info};
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 /// Bluetooth LE proxy for Home Assistant, speaking the ESPHome Native API.
 #[derive(Debug, Parser)]
@@ -126,13 +130,19 @@ impl From<ScanModeArg> for bleproxy_core::scanner::ScanMode {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    tracing_subscriber::fmt()
-        .with_max_level(cli.log_level)
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
+    // Logs go to stderr and, at the level they ask for, to API clients.
+    let logs = Arc::new(Logs::default());
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(std::io::stderr)
+                .with_ansi(std::io::stderr().is_terminal())
+                .with_filter(cli.log_level),
+        )
+        .with(logs.layer())
         .init();
-    match run(cli).await {
+    match run(cli, logs).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             error!("{err}");
@@ -141,12 +151,12 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+async fn run(mut cli: Cli, logs: Arc<Logs>) -> Result<(), Box<dyn Error>> {
     // Catch configuration mistakes before touching the Bluetooth stack.
     if let Some(name) = &cli.name {
         validate_name(name)?;
     }
-    let encryption = match (cli.encryption_key, &cli.encryption_key_file) {
+    let encryption = match (cli.encryption_key.take(), &cli.encryption_key_file) {
         (Some(key), _) => Some(key),
         (None, Some(path)) => {
             let text = std::fs::read_to_string(path)
@@ -159,45 +169,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let diagnostics = Arc::new(Diagnostics::new());
     tokio::spawn(Arc::clone(&diagnostics).count_advertisements(advertisements.subscribe()));
 
-    #[cfg(target_os = "linux")]
-    let (bluetooth_mac, scanner, connections) = {
-        let address = bleproxy::bluez::adapter_address(&cli.adapter)
-            .await
-            .map_err(|err| format!("cannot use Bluetooth adapter {}: {err}", cli.adapter))?;
-        info!(adapter = cli.adapter, %address, "using Bluetooth adapter");
-        let filter = bleproxy::filter::AddressFilter::new(cli.allow_addresses);
-        if filter.is_restricted() {
-            info!(devices = %filter, "only forwarding allowed devices");
-        }
-        let (handle, driver) = bleproxy::scanner::channel(cli.scan_mode.into());
-        tokio::spawn(bleproxy::bluez::scan_forever(
-            cli.adapter.clone(),
-            driver,
-            advertisements.clone(),
-            filter.clone(),
-        ));
-        let connections = (cli.connection_slots > 0).then(|| {
-            let (handle, driver) = bleproxy::connections::channel(cli.connection_slots, filter);
-            tokio::spawn(bleproxy::bluez::manage_connections(
-                cli.adapter.clone(),
-                driver,
-            ));
-            handle
-        });
-        (address, Some(handle), connections)
-    };
-    #[cfg(not(target_os = "linux"))]
-    let (bluetooth_mac, scanner, connections) = {
-        tracing::warn!(
-            "Bluetooth scanning is not supported on this platform yet; serving the API only"
-        );
-        let address = bleproxy::identity::derived_mac(cli.name.as_deref().unwrap_or("bleproxy"));
-        (
-            address,
-            None::<bleproxy::scanner::ScannerHandle>,
-            None::<bleproxy::connections::ConnectionsHandle>,
-        )
-    };
+    let Bluetooth {
+        mac: bluetooth_mac,
+        scanner,
+        connections,
+        config: platform_config,
+    } = start_bluetooth(&cli, &advertisements).await?;
     let mac = cli.mac.unwrap_or(bluetooth_mac);
     let mut identity = Identity::new(cli.name, cli.friendly_name, mac, bluetooth_mac)?;
     if let Some(scanner) = &scanner {
@@ -229,6 +206,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Some(announcement)
     };
 
+    let config = [
+        format!("bleproxy {}", Identity::VERSION),
+        format!("Name: {} ({})", identity.name(), identity.friendly_name()),
+        format!("MAC address: {}", identity.mac_address()),
+        format!("API: {address}"),
+        format!(
+            "Encryption: {}",
+            if encryption.is_some() { "on" } else { "off" }
+        ),
+        format!(
+            "mDNS: {}",
+            if announcement.is_some() { "on" } else { "off" }
+        ),
+    ]
+    .into_iter()
+    .chain(platform_config)
+    .collect();
     let context = server::Context {
         identity,
         advertisements,
@@ -236,6 +230,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         diagnostics,
         encryption,
         connections,
+        logs,
+        config,
     };
     let served = server::serve(listener, context, shutdown_signal()).await;
     info!("shutting down");
@@ -243,6 +239,77 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         tokio::task::spawn_blocking(|| announcement.stop()).await?;
     }
     Ok(served?)
+}
+
+/// What the platform's Bluetooth stack offers clients.
+struct Bluetooth {
+    /// The adapter's address, or one derived from the name without one.
+    mac: BdAddr,
+    scanner: Option<bleproxy::scanner::ScannerHandle>,
+    connections: Option<bleproxy::connections::ConnectionsHandle>,
+    /// Lines describing the Bluetooth configuration.
+    config: Vec<String>,
+}
+
+/// Starts scanning and managing connections through BlueZ.
+#[cfg(target_os = "linux")]
+async fn start_bluetooth(
+    cli: &Cli,
+    advertisements: &broadcast::Sender<bleproxy_core::Advertisement>,
+) -> Result<Bluetooth, Box<dyn Error>> {
+    let address = bleproxy::bluez::adapter_address(&cli.adapter)
+        .await
+        .map_err(|err| format!("cannot use Bluetooth adapter {}: {err}", cli.adapter))?;
+    info!(adapter = cli.adapter, %address, "using Bluetooth adapter");
+    let filter = bleproxy::filter::AddressFilter::new(cli.allow_addresses.clone());
+    if filter.is_restricted() {
+        info!(devices = %filter, "only forwarding allowed devices");
+    }
+    let config = vec![
+        format!("Bluetooth adapter: {} ({address})", cli.adapter),
+        format!("Scan mode: {:?}", cli.scan_mode),
+        format!("Devices: {filter}"),
+        format!("Connection slots: {}", cli.connection_slots),
+    ];
+    let (handle, driver) = bleproxy::scanner::channel(cli.scan_mode.into());
+    tokio::spawn(bleproxy::bluez::scan_forever(
+        cli.adapter.clone(),
+        driver,
+        advertisements.clone(),
+        filter.clone(),
+    ));
+    let connections = (cli.connection_slots > 0).then(|| {
+        let (handle, driver) = bleproxy::connections::channel(cli.connection_slots, filter);
+        tokio::spawn(bleproxy::bluez::manage_connections(
+            cli.adapter.clone(),
+            driver,
+        ));
+        handle
+    });
+    Ok(Bluetooth {
+        mac: address,
+        scanner: Some(handle),
+        connections,
+        config,
+    })
+}
+
+/// Serves the API without Bluetooth, which this platform lacks so far.
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unused_async, reason = "matches the Linux version")]
+async fn start_bluetooth(
+    cli: &Cli,
+    _: &broadcast::Sender<bleproxy_core::Advertisement>,
+) -> Result<Bluetooth, Box<dyn Error>> {
+    tracing::warn!(
+        "Bluetooth scanning is not supported on this platform yet; serving the API only"
+    );
+    Ok(Bluetooth {
+        mac: bleproxy::identity::derived_mac(cli.name.as_deref().unwrap_or("bleproxy")),
+        scanner: None,
+        connections: None,
+        config: Vec::new(),
+    })
 }
 
 /// Completes on Ctrl-C, or on SIGTERM where it exists.

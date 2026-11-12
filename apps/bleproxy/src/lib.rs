@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub mod encryption;
 pub mod filter;
 pub mod identity;
+pub mod logs;
 pub mod mdns;
 pub mod scanner;
 pub mod server;

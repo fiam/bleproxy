@@ -17,7 +17,7 @@ use bleproxy_protocol::{
     BluetoothGattGetServicesDoneResponse, BluetoothGattGetServicesResponse,
     BluetoothGattNotifyDataResponse, BluetoothGattNotifyResponse, BluetoothGattReadResponse,
     BluetoothGattService, BluetoothGattWriteResponse, BluetoothLeRawAdvertisementsResponse,
-    ClientMessage, PingRequest, RawAdvertisement,
+    ClientMessage, PingRequest, RawAdvertisement, SubscribeLogsResponse, log_level,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -29,6 +29,7 @@ use crate::Identity;
 use crate::connections::{Client, ConnectionsHandle, Event, Service, Slots};
 use crate::diagnostics::{self, Diagnostics, STATE_INTERVAL};
 use crate::encryption::EncryptionKey;
+use crate::logs::{self, LogLine, LogSubscriber, Logs};
 use crate::scanner::{SCANNING_SWITCH, ScannerHandle};
 use crate::transport::{Message, Transport, TransportError};
 
@@ -85,6 +86,11 @@ pub struct Context {
     pub encryption: Option<EncryptionKey>,
     /// The connection manager, if clients may connect to devices.
     pub connections: Option<ConnectionsHandle>,
+    /// The proxy's logs, for clients that subscribe to them.
+    pub logs: Arc<Logs>,
+    /// Lines describing the proxy's configuration, logged to clients that
+    /// ask for it.
+    pub config: Arc<[String]>,
 }
 
 /// Accepts API connections on `listener` until `shutdown` completes.
@@ -150,6 +156,7 @@ pub async fn handle_connection(
     let mut scanning = context.scanner.as_ref().map(ScannerHandle::wanted);
     let mut connections = context.connections.as_ref().map(ConnectionsHandle::client);
     let mut slots = None;
+    let mut log_lines = None;
 
     let mut inbox = Vec::with_capacity(1024);
     let mut subscription: Option<broadcast::Receiver<Advertisement>> = None;
@@ -171,21 +178,13 @@ pub async fn handle_connection(
                 keepalive.heard(Instant::now());
                 idle.as_mut().reset(keepalive.deadline());
                 let client = connections.as_ref();
-                if handle_messages(&mut inbox, &mut out, &mut session, context, client, &mut keepalive).await? {
+                if handle_messages(&mut inbox, &mut out, &mut session, context, client, &mut keepalive, &mut log_lines).await? {
                     out.writer.shutdown().await?;
                     return Ok(());
                 }
                 // Follow subscription changes made by the messages above.
                 follow_advertisements(&session, context, &mut subscription, &mut batch, scanner_status.as_mut(), &mut out).await?;
-                // Report the free slots to new subscribers, then follow them.
-                if slots.is_none() && session.wants_connections_free()
-                    && let Some(handle) = &context.connections
-                {
-                    let mut receiver = handle.slots();
-                    let current = receiver.borrow_and_update().clone();
-                    out.slots(&current).await?;
-                    slots = Some(receiver);
-                }
+                follow_slots(&session, context, &mut slots, &mut out).await?;
             }
             event = next_event(&mut connections) => out.event(&event).await?,
             Some(current) = changed(&mut slots) => out.slots(&current).await?,
@@ -200,6 +199,12 @@ pub async fn handle_connection(
                     warn!(missed, "client is too slow, dropped advertisements");
                 }
                 Err(broadcast::error::RecvError::Closed) => subscription = None,
+            },
+            received = recv_log(&mut log_lines) => match received {
+                Ok(line) => out.log(&line).await?,
+                // Not logged: the warning would go to this client too.
+                Err(broadcast::error::RecvError::Lagged(missed)) => out.logs_dropped(missed).await?,
+                Err(broadcast::error::RecvError::Closed) => log_lines = None,
             },
             Some(status) = changed(&mut scanner_status), if subscription.is_some() => {
                 if let Some(reply) = session.scanner_state(status) {
@@ -258,6 +263,26 @@ async fn follow_advertisements<W: AsyncWriteExt + Unpin + Send>(
     Ok(())
 }
 
+/// Reports the free connection slots to new subscribers, who then follow
+/// them.
+async fn follow_slots<W: AsyncWriteExt + Unpin + Send>(
+    session: &Session<'_>,
+    context: &Context,
+    slots: &mut Option<watch::Receiver<Slots>>,
+    out: &mut Outbound<W>,
+) -> Result<(), ConnectionError> {
+    if slots.is_none()
+        && session.wants_connections_free()
+        && let Some(handle) = &context.connections
+    {
+        let mut receiver = handle.slots();
+        let current = receiver.borrow_and_update().clone();
+        out.slots(&current).await?;
+        *slots = Some(receiver);
+    }
+    Ok(())
+}
+
 /// Handles the complete messages in `inbox`, and returns whether the
 /// session asked to close the connection.
 async fn handle_messages<W: AsyncWriteExt + Unpin + Send>(
@@ -267,6 +292,7 @@ async fn handle_messages<W: AsyncWriteExt + Unpin + Send>(
     context: &Context,
     client: Option<&Client>,
     keepalive: &mut Keepalive,
+    log_lines: &mut Option<LogSubscriber>,
 ) -> Result<bool, ConnectionError> {
     while let Some(Message {
         message_type,
@@ -287,6 +313,14 @@ async fn handle_messages<W: AsyncWriteExt + Unpin + Send>(
         // Like ESPHome, send the current states to new subscribers.
         if !subscribed && session.wants_states() {
             out.states(context).await?;
+        }
+        if let Some(subscription) = outcome.logs {
+            // A new subscription replaces the old one.
+            *log_lines = (subscription.level > log_level::NONE)
+                .then(|| context.logs.subscribe(subscription.level));
+            if subscription.dump_config {
+                out.config(context).await?;
+            }
         }
         forward(&outcome, context, client);
         if outcome.close {
@@ -392,6 +426,16 @@ async fn next_event(client: &mut Option<Client>) -> Event {
     }
 }
 
+/// Receives the next log line, or waits forever without a subscription.
+async fn recv_log(
+    subscriber: &mut Option<LogSubscriber>,
+) -> Result<LogLine, broadcast::error::RecvError> {
+    match subscriber {
+        Some(subscriber) => subscriber.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Receives from `subscription`, or waits forever without one.
 async fn recv(
     subscription: &mut Option<broadcast::Receiver<Advertisement>>,
@@ -467,6 +511,37 @@ impl<W: AsyncWriteExt + Unpin> Outbound<W> {
         }
         for state in context.diagnostics.sensor_states() {
             self.message(&state).await?;
+        }
+        Ok(())
+    }
+
+    async fn log(&mut self, line: &LogLine) -> Result<(), ConnectionError> {
+        self.message(&SubscribeLogsResponse {
+            level: line.level,
+            message: line.text.as_bytes(),
+        })
+        .await
+    }
+
+    /// Tells a client that fell behind how many lines it missed. Not
+    /// logged, since the warning would go to the client too.
+    async fn logs_dropped(&mut self, missed: u64) -> Result<(), ConnectionError> {
+        let text = format!("{missed} log lines dropped");
+        self.log(&LogLine {
+            level: log_level::WARN,
+            text: logs::format_line(log_level::WARN, "server", &text),
+        })
+        .await
+    }
+
+    /// Logs the proxy's configuration, as ESPHome devices do on request.
+    async fn config(&mut self, context: &Context) -> Result<(), ConnectionError> {
+        for line in context.config.iter() {
+            self.log(&LogLine {
+                level: log_level::CONFIG,
+                text: logs::format_line(log_level::CONFIG, "bleproxy", line),
+            })
+            .await?;
         }
         Ok(())
     }
@@ -669,6 +744,9 @@ fn log_message(message: &ClientMessage<'_>) {
         }
         ClientMessage::UnsubscribeBluetoothLeAdvertisements => {
             info!("client unsubscribed from advertisements");
+        }
+        ClientMessage::SubscribeLogs { level, dump_config } => {
+            info!(level, dump_config, "client subscribed to logs");
         }
         ClientMessage::Unknown(message_type) => debug!(message_type, "ignoring unknown message"),
         other => debug!(?other, "received"),
