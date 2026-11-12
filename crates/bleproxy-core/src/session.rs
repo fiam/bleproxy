@@ -9,7 +9,9 @@
 //! with [`Session::scanner_state`]. Operations on device connections reach
 //! the platform as [`Outcome::connection`]; it sends their results, and
 //! the free connection slots once [`Session::wants_connections_free`],
-//! itself.
+//! itself. The platform's own entities, such as diagnostic sensors, are
+//! listed when [`Outcome::list_entities`] says so, and their states sent
+//! once [`Session::wants_states`].
 
 use bleproxy_protocol::Message;
 use bleproxy_protocol::wire::{Encode, EncodeError};
@@ -157,6 +159,9 @@ pub struct Outcome<'a, 'm> {
     pub scan_mode: Option<ScanMode>,
     /// Operation on a device connection for the platform to carry out.
     pub connection: Option<ConnectionRequest<&'m [u8]>>,
+    /// Whether to describe the platform's entities before sending `reply`,
+    /// which ends the list.
+    pub list_entities: bool,
 }
 
 impl<'a> Outcome<'a, '_> {
@@ -165,6 +170,7 @@ impl<'a> Outcome<'a, '_> {
         close: false,
         scan_mode: None,
         connection: None,
+        list_entities: false,
     };
     const CLOSE: Self = Self {
         close: true,
@@ -192,6 +198,7 @@ pub struct Session<'a> {
     phase: Phase,
     raw_advertisements: bool,
     connections_free: bool,
+    states: bool,
 }
 
 impl<'a> Session<'a> {
@@ -203,6 +210,7 @@ impl<'a> Session<'a> {
             phase: Phase::AwaitingHello,
             raw_advertisements: false,
             connections_free: false,
+            states: false,
         }
     }
 
@@ -210,6 +218,13 @@ impl<'a> Session<'a> {
     #[must_use]
     pub const fn wants_raw_advertisements(&self) -> bool {
         self.raw_advertisements
+    }
+
+    /// Returns whether the client wants the states of the platform's
+    /// entities: their current states, and then their changes.
+    #[must_use]
+    pub const fn wants_states(&self) -> bool {
+        self.states
     }
 
     /// Returns whether the client wants to follow the free connection
@@ -267,8 +282,13 @@ impl<'a> Session<'a> {
                 bluetooth_mac_address: identity.bluetooth_mac_address,
                 api_encryption_supported: identity.encrypted,
             })),
-            ClientMessage::ListEntities => {
-                Outcome::reply(Reply::ListEntitiesDone(ListEntitiesDoneResponse))
+            ClientMessage::ListEntities => Outcome {
+                list_entities: true,
+                ..Outcome::reply(Reply::ListEntitiesDone(ListEntitiesDoneResponse))
+            },
+            ClientMessage::SubscribeStates => {
+                self.states = true;
+                Outcome::NOTHING
             }
             ClientMessage::SubscribeBluetoothLeAdvertisements { flags } => {
                 // Only the raw format is implemented; it is the one clients
@@ -296,7 +316,7 @@ impl<'a> Session<'a> {
                 connection: ConnectionRequest::from_message(message),
                 ..Outcome::NOTHING
             },
-            // No password, no entities, no logs or services to stream.
+            // No password, no logs or services to stream.
             _ => Outcome::NOTHING,
         }
     }
@@ -510,6 +530,23 @@ mod tests {
     }
 
     #[test]
+    fn leaves_entities_to_the_platform() {
+        let mut session = established();
+        let outcome = session.handle(&ClientMessage::ListEntities);
+        assert!(outcome.list_entities);
+        assert_eq!(
+            outcome.reply,
+            Some(Reply::ListEntitiesDone(ListEntitiesDoneResponse))
+        );
+        assert!(!session.wants_states());
+        let outcome = session.handle(&ClientMessage::SubscribeStates);
+        assert_eq!(outcome, Outcome::NOTHING);
+        assert!(session.wants_states());
+        // Other messages don't ask for entities.
+        assert!(!session.handle(&ClientMessage::Ping).list_entities);
+    }
+
+    #[test]
     fn answers_routine_requests() {
         let mut session = established();
         let cases = [
@@ -527,7 +564,6 @@ mod tests {
                 })),
             ),
             (ClientMessage::Authentication, None),
-            (ClientMessage::SubscribeStates, None),
             (ClientMessage::SubscribeLogs, None),
             (ClientMessage::SubscribeHomeassistantServices, None),
             (ClientMessage::SubscribeHomeAssistantStates, None),
