@@ -27,6 +27,8 @@ from aioesphomeapi.model import (
     SensorInfo,
     SensorState,
     SensorStateClass,
+    SwitchInfo,
+    SwitchState,
     TextSensorInfo,
     TextSensorState,
 )
@@ -265,6 +267,16 @@ async def wait_for(advertisements, predicate, what):
     raise AssertionError(f"timed out waiting for {what}")
 
 
+async def wait_for_new(items, seen, predicate, what):
+    """Like wait_for, but only for items that arrive after the first `seen`."""
+    async with asyncio.timeout(TIMEOUT):
+        while True:
+            for item in items[seen:]:
+                if predicate(item):
+                    return item
+            await asyncio.sleep(0.05)
+
+
 def monitor_properties(bus, pid, root):
     """Reads bleproxy's advertisement monitor, as BlueZ would."""
     names = dbus.Interface(
@@ -307,18 +319,25 @@ async def check_scanning_started(bus, mode, pid):
         assert (0, 0x01, b"\x06") in patterns, patterns
 
 
-async def check_diagnostics(client):
-    """The proxy's own sensors, listed and reported like ESPHome entities."""
-    step("checking the diagnostic sensors")
+async def check_entities(client):
+    """The proxy's own entities, listed and reported like ESPHome's.
+
+    Returns the scanning switch and the list states keep arriving in.
+    """
+    step("checking the diagnostic sensors and the scanning switch")
     entities, services = await client.list_entities_services()
     assert not services, services
     by_id = {entity.object_id: entity for entity in entities}
-    assert set(by_id) == {"uptime", "advertisements", "connected_clients"}, by_id
+    sensors = {"uptime", "advertisements", "connected_clients"}
+    assert set(by_id) == sensors | {"ble_scanning"}, by_id
     assert isinstance(by_id["uptime"], TextSensorInfo), by_id
     assert isinstance(by_id["advertisements"], SensorInfo), by_id
     assert by_id["advertisements"].state_class == SensorStateClass.TOTAL_INCREASING, by_id
     assert by_id["connected_clients"].state_class == SensorStateClass.MEASUREMENT, by_id
-    assert all(e.entity_category == EntityCategory.DIAGNOSTIC for e in entities), entities
+    assert all(by_id[s].entity_category == EntityCategory.DIAGNOSTIC for s in sensors), by_id
+    switch = by_id["ble_scanning"]
+    assert isinstance(switch, SwitchInfo), switch
+    assert switch.entity_category == EntityCategory.CONFIG, switch
 
     states = []
     client.subscribe_states(states.append)
@@ -330,6 +349,44 @@ async def check_diagnostics(client):
     assert isinstance(uptime, TextSensorState) and uptime.state.endswith("s"), uptime
     clients = by_key[by_id["connected_clients"].key]
     assert isinstance(clients, SensorState) and clients.state == 1, clients
+    scanning = by_key[switch.key]
+    assert isinstance(scanning, SwitchState) and scanning.state, scanning
+    return switch, states
+
+
+async def check_scanning_switch(client, bus, mode, switch, states, scanner_states):
+    """Turning the BLE Scanning switch off stops the scan; on restarts it."""
+    configured = MODES[mode]
+    start = "StartDiscovery" if mode == "active" else "RegisterMonitor"
+    stop = "StopDiscovery" if mode == "active" else "UnregisterMonitor"
+
+    step("switching scanning off")
+    seen_scanner, seen_states = len(scanner_states), len(states)
+    client.switch_command(switch.key, False)
+    await wait_for_new(
+        scanner_states,
+        seen_scanner,
+        lambda s: s.state == BluetoothScannerState.STOPPED,
+        "the stopped scanner",
+    )
+    await wait_for_call(bus, "/org/bluez/hci0", stop)
+    await wait_for_new(
+        states, seen_states, lambda s: s.key == switch.key and not s.state, "switch off"
+    )
+
+    step("switching scanning back on")
+    seen_scanner, seen_states = len(scanner_states), len(states)
+    client.switch_command(switch.key, True)
+    await wait_for_call(bus, "/org/bluez/hci0", start, count=2)
+    await wait_for_new(
+        scanner_states,
+        seen_scanner,
+        lambda s: s.state == BluetoothScannerState.RUNNING and s.mode == configured,
+        "the scanner running again",
+    )
+    await wait_for_new(
+        states, seen_states, lambda s: s.key == switch.key and s.state, "switch on"
+    )
 
 
 def start_proxy(binary, mode, env):
@@ -432,7 +489,7 @@ async def main(binary, mode, encrypted, filtered):
         # Passive scan, active connections, remote caching, raw
         # advertisements, and state and mode.
         assert flags == 0b110_0111, flags
-        await check_diagnostics(client)
+        switch, entity_states = await check_entities(client)
 
         states = []
         client.subscribe_bluetooth_scanner_state(states.append)
@@ -453,6 +510,7 @@ async def main(binary, mode, encrypted, filtered):
 
         step("checking that scanning was started")
         await check_scanning_started(bus, mode, proxy.pid)
+        await check_scanning_switch(client, bus, mode, switch, entity_states, states)
 
         address = int(DEVICE_ADDRESS.replace(":", ""), 16)
         step("adding a device")
