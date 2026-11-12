@@ -120,6 +120,10 @@ scanner, and Bluetooth devices near the server appear in Home Assistant.
 Integrations that talk to devices rather than only listening (locks, lights,
 some sensors) connect to them through the proxy too.
 
+The proxy's device page has three diagnostic sensors about the proxy itself,
+refreshed every minute: its uptime, how many advertisements it has forwarded
+since starting, and how many clients (hosts) are connected to it.
+
 ### Configuration
 
 Every option is a command-line flag and a `BLEPROXY_*` environment variable:
@@ -339,14 +343,18 @@ in both scan modes:
   BlueZ (python-dbusmock).
 - bleproxy runs against it as an unprivileged user.
 - aioesphomeapi, the client library Home Assistant uses, checks the device
-  info, that new and updated devices arrive as the expected raw
-  advertisements, the reported scanner state and switching modes at runtime.
+  info and diagnostic sensors, that new and updated devices arrive as the
+  expected raw advertisements, the reported scanner state and switching
+  modes at runtime.
 - The mock exports a GATT database like bluetoothd, and the client connects
   through bleproxy, lists services, reads, writes, subscribes to
   notifications and disconnects, checking BlueZ's quirks along the way.
-- A third run does the same over an encrypted connection, and checks that
-  clients with a wrong key, or none, are rejected with the errors Home
-  Assistant expects.
+- A third run does the same over an encrypted connection with an address
+  filter. It checks that clients with a wrong key, or none, are rejected with
+  the errors Home Assistant expects, and that filtered out devices are not
+  forwarded.
+- A last run takes away BlueZ's advertisement monitors and checks that
+  passive scanning falls back to active.
 
 ### Firmware
 
@@ -424,6 +432,7 @@ Releases are fully automated with [release-please]:
 - [x] Scanner state and mode switching from Home Assistant
 - [x] Noise encryption (ESPHome API encryption keys)
 - [x] Active connections (GATT proxying) on Linux
+- [x] Diagnostic sensors: uptime, forwarded advertisements, connected clients
 - [ ] Windows and macOS backends
 - [ ] BLE scanning on ESP32 via esp-radio and TrouBLE
 
