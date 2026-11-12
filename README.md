@@ -90,6 +90,32 @@ access to BlueZ. The image runs unprivileged, as `nobody`.
 Images are published for `linux/amd64` and `linux/arm64`: `:edge` follows
 `main`, `:latest` and `:X.Y.Z` are releases.
 
+### With Podman
+
+The [quadlet](deploy/bleproxy.container) runs the image as a systemd service
+that starts at boot, with the same read-only, capability-free setup. Settings
+go in an environment file that only root can read, since it may hold the
+encryption key:
+
+```sh
+sudo install -D -m 0600 /dev/null /etc/bleproxy/bleproxy.env
+sudoedit /etc/bleproxy/bleproxy.env    # BLEPROXY_NAME=..., and so on
+sudo install -m 0644 deploy/bleproxy.container /etc/containers/systemd/
+sudo systemctl daemon-reload && sudo systemctl start bleproxy
+journalctl -u bleproxy -f
+```
+
+On Ubuntu and Debian, the container engine's default AppArmor profile keeps
+containers off the system bus, and bleproxy fails with `AccessDenied`. Load
+the [bleproxy profile](deploy/apparmor/bleproxy), which allows just what it
+needs, and uncomment `PodmanArgs` in the quadlet (or pass
+`--security-opt apparmor=bleproxy` to `docker run`):
+
+```sh
+sudo install -m 0644 deploy/apparmor/bleproxy /etc/apparmor.d/bleproxy
+sudo apparmor_parser -r /etc/apparmor.d/bleproxy
+```
+
 ### As a systemd service
 
 Download a binary from the [releases][release] or build one
@@ -258,7 +284,7 @@ bleproxy/
 │   ├── bleproxy/            # host app (Linux, Windows, macOS)
 │   │   └── src/             # server, transport, scanner, mdns, bluez (Linux), ...
 │   └── bleproxy-esp32/      # firmware (ESP32-C3, ESP32-S3)
-├── deploy/                  # systemd unit, sysusers config, Compose file
+├── deploy/                  # systemd unit, Compose file, podman quadlet, AppArmor
 ├── docker/                  # containers for cross-platform and end-to-end tests
 └── xtask/                   # development task runner: `cargo xtask`
 ```

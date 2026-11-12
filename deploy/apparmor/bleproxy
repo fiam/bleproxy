@@ -1,0 +1,45 @@
+# AppArmor profile for the bleproxy container.
+#
+# Container engines on Ubuntu and Debian confine containers with a default
+# profile that has no D-Bus rules, which keeps bleproxy off the system bus.
+# This one allows what bleproxy needs and nothing more:
+#
+#   sudo install -m 0644 deploy/apparmor/bleproxy /etc/apparmor.d/bleproxy
+#   sudo apparmor_parser -r /etc/apparmor.d/bleproxy
+#
+# then run the container with `--security-opt apparmor=bleproxy`.
+
+#include <tunables/global>
+
+profile bleproxy flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  /usr/local/bin/bleproxy mrix,
+  /proc/** r,
+  /sys/class/net/** r,
+  /sys/devices/** r,
+
+  # The ESPHome API, and mDNS, which bleproxy answers itself.
+  network inet stream,
+  network inet6 stream,
+  network inet dgram,
+  network inet6 dgram,
+  # Following the host's addresses.
+  network netlink raw,
+
+  # The system bus, and BlueZ on it.
+  network unix stream,
+  /run/dbus/system_bus_socket rw,
+  dbus (send, receive) bus=system peer=(name=org.freedesktop.DBus),
+  dbus (send, receive) bus=system peer=(name=org.bluez),
+  # Broadcast signals carry BlueZ's unique bus name, not org.bluez.
+  dbus receive bus=system path=/org/bluez{,/**} interface=org.freedesktop.DBus.Properties peer=(label=unconfined),
+  dbus receive bus=system path=/ interface=org.freedesktop.DBus.ObjectManager peer=(label=unconfined),
+  # In passive mode BlueZ calls the advertisement monitor bleproxy exports.
+  dbus receive bus=system path=/io/github/fiam/bleproxy{,/**} peer=(label=unconfined),
+
+  # Stopping the container.
+  signal (receive),
+  signal (send) peer=bleproxy,
+  signal (send) peer="crun//&bleproxy",
+}

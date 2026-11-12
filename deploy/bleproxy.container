@@ -1,0 +1,47 @@
+# Podman quadlet that runs the bleproxy image as a systemd service.
+#
+#   sudo install -D -m 0600 /dev/null /etc/bleproxy/bleproxy.env
+#   sudo install -m 0644 deploy/bleproxy.container /etc/containers/systemd/
+#   sudo systemctl daemon-reload && sudo systemctl start bleproxy
+#   journalctl -u bleproxy -f
+#
+# Quadlet turns this file into bleproxy.service, started at boot through
+# the [Install] section below.
+#
+# Settings go in BLEPROXY_* variables in /etc/bleproxy/bleproxy.env, which
+# only root can read since it may hold the encryption key:
+#
+#   BLEPROXY_NAME=bleproxy-garage
+#   BLEPROXY_ALLOW_ADDRESS=5C:CA:D3:BA:BA:CC=Scale
+#   BLEPROXY_ENCRYPTION_KEY=<openssl rand -base64 32>
+#
+# On Ubuntu and Debian, podman's default AppArmor profile keeps the
+# container off the system bus (bleproxy then fails with AccessDenied). Load
+# deploy/apparmor/bleproxy and uncomment PodmanArgs below.
+
+[Unit]
+Description=bleproxy, a Bluetooth LE proxy for Home Assistant
+Documentation=https://github.com/fiam/bleproxy
+Wants=bluetooth.service network-online.target
+After=bluetooth.service network-online.target
+
+[Container]
+# :edge follows main; use :latest or :X.Y.Z for releases.
+Image=ghcr.io/fiam/bleproxy:edge
+ContainerName=bleproxy
+# mDNS needs the host's network, and Home Assistant connects to :6053.
+Network=host
+# The host's system bus, where BlueZ (bluetoothd) lives.
+Volume=/run/dbus:/run/dbus:ro
+EnvironmentFile=/etc/bleproxy/bleproxy.env
+ReadOnly=true
+DropCapability=all
+NoNewPrivileges=true
+#PodmanArgs=--security-opt=apparmor=bleproxy
+
+[Service]
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
