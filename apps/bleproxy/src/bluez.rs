@@ -15,7 +15,8 @@
 //!   BlueZ only listens. Monitors need patterns; like Home Assistant's own
 //!   passive scanner, the ones used here match the common Flags values,
 //!   so devices that advertise without flags go unseen. It needs a BlueZ
-//!   with the `AdvertisementMonitor` API enabled.
+//!   with the `AdvertisementMonitor` API enabled; without it the scan
+//!   falls back to active mode, and reports that mode to clients.
 //!
 //! API clients can switch between them at runtime (see
 //! [`crate::scanner`]).
@@ -158,12 +159,9 @@ async fn scan(
     let mut removed = signals(&connection, OBJECT_MANAGER, "InterfacesRemoved", "/").await?;
 
     power_on(&connection, &path).await?;
-    match mode {
-        ScanMode::Active => start_discovery(&connection, &path).await?,
-        ScanMode::Passive => register_monitor(&connection, &path).await?,
-    }
-    info!(adapter, ?mode, "scanning");
-    driver.report(ScannerState::Running, mode);
+    let scanning = start(&connection, &path, mode).await?;
+    info!(adapter, mode = ?scanning, "scanning");
+    driver.report(ScannerState::Running, scanning);
 
     let mut devices = Devices::new(&path);
     let objects: ManagedObjects = connection
@@ -189,9 +187,9 @@ async fn scan(
             Some(message) = added.next() => (message?, Signal::Added),
             Some(message) = removed.next() => (message?, Signal::Removed),
             next = driver.mode_change(mode) => {
-                driver.report(ScannerState::Stopping, mode);
-                stop(&connection, &path, mode).await;
-                driver.report(ScannerState::Stopped, mode);
+                driver.report(ScannerState::Stopping, scanning);
+                stop(&connection, &path, scanning).await;
+                driver.report(ScannerState::Stopped, scanning);
                 return Ok(next);
             }
             else => return Err(BluezError::Disconnected),
@@ -269,6 +267,31 @@ async fn signals(
     Ok(MessageStream::for_match_rule(rule, connection, None).await?)
 }
 
+/// Starts scanning in `mode`, and returns the mode actually scanning in:
+/// active instead of passive if BlueZ can't scan passively.
+async fn start(
+    connection: &Connection,
+    path: &str,
+    mode: ScanMode,
+) -> Result<ScanMode, BluezError> {
+    match mode {
+        ScanMode::Active => start_discovery(connection, path).await?,
+        ScanMode::Passive => match register_monitor(connection, path).await {
+            Ok(()) => return Ok(ScanMode::Passive),
+            Err(BluezError::DBus(err)) if monitors_unsupported(&err) => {
+                warn!(
+                    %err,
+                    "BlueZ doesn't offer advertisement monitors (older releases need \
+                     bluetoothd --experimental); scanning actively instead"
+                );
+                start_discovery(connection, path).await?;
+            }
+            Err(err) => return Err(err),
+        },
+    }
+    Ok(ScanMode::Active)
+}
+
 async fn start_discovery(connection: &Connection, path: &str) -> Result<(), BluezError> {
     let filter = HashMap::from([
         ("Transport", Variant::from("le")),
@@ -289,8 +312,6 @@ async fn start_discovery(connection: &Connection, path: &str) -> Result<(), Blue
     Ok(())
 }
 
-/// Serves an advertisement monitor and registers it with the adapter,
-/// which makes BlueZ scan passively for it.
 /// Stops scanning in `mode`. Best effort: BlueZ also stops when our bus
 /// connection closes, which follows right after.
 async fn stop(connection: &Connection, path: &str, mode: ScanMode) {
@@ -320,6 +341,8 @@ async fn stop(connection: &Connection, path: &str, mode: ScanMode) {
     }
 }
 
+/// Serves an advertisement monitor and registers it with the adapter,
+/// which makes BlueZ scan passively for it.
 async fn register_monitor(connection: &Connection, path: &str) -> Result<(), BluezError> {
     let server = connection.object_server();
     server.at(MONITOR_ROOT, zbus::fdo::ObjectManager).await?;
@@ -335,6 +358,23 @@ async fn register_monitor(connection: &Connection, path: &str) -> Result<(), Blu
         )
         .await?;
     Ok(())
+}
+
+/// Returns whether `err` means BlueZ has no advertisement monitor API: the
+/// adapter lacks the manager interface, as with releases that only offer it
+/// with `--experimental`, or the controller can't monitor.
+fn monitors_unsupported(err: &zbus::Error) -> bool {
+    match err {
+        // zbus turns the standard D-Bus errors into `FDO` errors.
+        zbus::Error::FDO(err) => matches!(
+            **err,
+            zbus::fdo::Error::UnknownMethod(_)
+                | zbus::fdo::Error::UnknownInterface(_)
+                | zbus::fdo::Error::UnknownObject(_)
+        ),
+        zbus::Error::MethodError(name, ..) => name.as_str() == "org.bluez.Error.NotSupported",
+        _ => false,
+    }
 }
 
 /// An `or_patterns` advertisement monitor that matches nearly every
@@ -605,6 +645,37 @@ fn saturate(value: i16) -> i8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn method_error(name: &str) -> zbus::Error {
+        let message = zbus::Message::method_call("/", "Ping").build(&()).unwrap();
+        zbus::Error::MethodError(
+            zbus::names::OwnedErrorName::try_from(name).unwrap(),
+            None,
+            message,
+        )
+    }
+
+    #[test]
+    fn recognizes_missing_monitor_support() {
+        use zbus::fdo::Error as Fdo;
+        for err in [
+            Fdo::UnknownMethod(String::new()),
+            Fdo::UnknownInterface(String::new()),
+            Fdo::UnknownObject(String::new()),
+        ] {
+            let err = zbus::Error::FDO(Box::new(err));
+            assert!(monitors_unsupported(&err), "{err}");
+        }
+        assert!(monitors_unsupported(&method_error(
+            "org.bluez.Error.NotSupported"
+        )));
+        // Other failures are retried rather than papered over.
+        assert!(!monitors_unsupported(&method_error(
+            "org.bluez.Error.Failed"
+        )));
+        let denied = zbus::Error::FDO(Box::new(Fdo::AccessDenied(String::new())));
+        assert!(!monitors_unsupported(&denied));
+    }
 
     fn variant(value: impl Into<Variant<'static>>) -> OwnedVariant {
         OwnedVariant::try_from(&Variant::new(value.into())).unwrap()

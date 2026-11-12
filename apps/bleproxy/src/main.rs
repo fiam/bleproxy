@@ -45,8 +45,8 @@ struct Cli {
     /// Scan mode to start in; Home Assistant can switch it at runtime.
     /// Active scanning sends scan requests and sees every device; passive
     /// scanning only listens, saving battery-powered devices energy, but
-    /// needs BlueZ's advertisement monitor support and misses devices that
-    /// advertise without flags.
+    /// needs BlueZ's advertisement monitor support (bleproxy scans actively
+    /// without it) and misses devices that advertise without flags.
     #[cfg(target_os = "linux")]
     #[arg(long, env = "BLEPROXY_SCAN_MODE", value_enum, default_value_t)]
     scan_mode: ScanModeArg,

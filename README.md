@@ -145,7 +145,8 @@ through a BlueZ advertisement monitor, which spares battery-powered devices
 the extra radio traffic. Like Home Assistant's own passive scanning, it
 matches advertisements by their flags, so devices that advertise without
 flags are not seen, and it needs a BlueZ with the advertisement monitor API
-(older releases only enable it with `bluetoothd --experimental`).
+(older releases only enable it with `bluetoothd --experimental`). Without
+it, bleproxy scans actively instead and reports that to Home Assistant.
 `--scan-mode` only sets the starting mode: Home Assistant shows the scanner's
 state and can switch modes at runtime, like with ESPHome proxies.
 
