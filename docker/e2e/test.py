@@ -25,6 +25,8 @@ from aioesphomeapi.model import BluetoothScannerMode, BluetoothScannerState
 PORT = 6053
 ADAPTER_ADDRESS = "00:01:02:03:04:05"  # what the mock assigns to hci0
 DEVICE_ADDRESS = "A4:C1:38:00:11:22"
+SECOND_ADDRESS = "A4:C1:38:00:33:44"
+BLOCKED_ADDRESS = "A4:C1:38:00:55:66"  # left out by the address filter
 TIMEOUT = 10
 MODES = {"active": BluetoothScannerMode.ACTIVE, "passive": BluetoothScannerMode.PASSIVE}
 NOBODY = 65534
@@ -296,13 +298,19 @@ async def check_scanning_started(bus, mode, pid):
         assert (0, 0x01, b"\x06") in patterns, patterns
 
 
-async def main(binary, mode, encrypted):
-    step(f"testing {mode} scanning" + (" with encryption" if encrypted else ""))
+async def main(binary, mode, encrypted, filtered):
+    step(
+        f"testing {mode} scanning"
+        + (" with encryption" if encrypted else "")
+        + (" and an address filter" if filtered else "")
+    )
     bus, mock = mock_bluez()
     key = base64.b64encode(os.urandom(32)).decode() if encrypted else None
     env = dict(os.environ)
     if key:
         env["BLEPROXY_ENCRYPTION_KEY"] = key
+    if filtered:
+        env["BLEPROXY_ALLOW_ADDRESS"] = f"{DEVICE_ADDRESS},{SECOND_ADDRESS}"
     step("starting bleproxy")
     # Unprivileged, as in deployments: the bus policy must let it in.
     proxy = subprocess.Popen(
@@ -417,9 +425,16 @@ async def main(binary, mode, encrypted):
             assert "UnregisterMonitor" in calls and "StartDiscovery" in calls, calls
 
         step("receiving advertisements after the switch")
-        second = int("A4C138003344", 16)
-        mock.AddDevice("hci0", "A4:C1:38:00:33:44", "ATC_3344")
+        if filtered:
+            # BlueZ signals arrive in order, so once the allowed device that
+            # appeared later is through, the filtered out one was dropped.
+            mock.AddDevice("hci0", BLOCKED_ADDRESS, "ATC_5566")
+        second = int(SECOND_ADDRESS.replace(":", ""), 16)
+        mock.AddDevice("hci0", SECOND_ADDRESS, "ATC_3344")
         await wait_for(received, lambda a: a.address == second, "the second device")
+        if filtered:
+            blocked = int(BLOCKED_ADDRESS.replace(":", ""), 16)
+            assert all(a.address != blocked for a in received), "forwarded a filtered out device"
 
         await check_connections(bus, client, path, flags)
     finally:
@@ -431,4 +446,5 @@ async def main(binary, mode, encrypted):
 
 
 if __name__ == "__main__":
-    asyncio.run(main(sys.argv[1], sys.argv[2], "encrypted" in sys.argv[3:]))
+    flags = sys.argv[3:]
+    asyncio.run(main(sys.argv[1], sys.argv[2], "encrypted" in flags, "filtered" in flags))
