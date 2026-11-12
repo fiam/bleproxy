@@ -16,7 +16,7 @@ use bleproxy_protocol::{
     BluetoothGattGetServicesDoneResponse, BluetoothGattGetServicesResponse,
     BluetoothGattNotifyDataResponse, BluetoothGattNotifyResponse, BluetoothGattReadResponse,
     BluetoothGattService, BluetoothGattWriteResponse, BluetoothLeRawAdvertisementsResponse,
-    ClientMessage, RawAdvertisement,
+    ClientMessage, PingRequest, RawAdvertisement,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -36,9 +36,14 @@ const BATCH_SIZE: usize = 16;
 /// How long advertisements may wait to fill a batch.
 const BATCH_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Connections that send nothing for this long are closed. Clients ping
-/// every 20 seconds or so.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// After hearing nothing from a client for this long, ping it, as ESPHome
+/// does. Clients only ping when they receive nothing themselves, so one
+/// kept busy with advertisements or scanner updates can stay quiet.
+const KEEPALIVE: Duration = Duration::from_secs(60);
+
+/// Connections that stay silent this long, ping included, are closed.
+/// ESPHome waits two and a half keepalive periods.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(150);
 
 /// Initial size of the buffer message payloads are encoded into. A full
 /// advertisement batch is under 1.5 KiB; the buffer grows for larger
@@ -142,7 +147,8 @@ pub async fn handle_connection(
     let mut batch = Vec::with_capacity(BATCH_SIZE);
     let mut flush = tokio::time::interval(BATCH_INTERVAL);
     flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let idle = tokio::time::sleep(IDLE_TIMEOUT);
+    let mut keepalive = Keepalive::new(Instant::now());
+    let idle = tokio::time::sleep_until(keepalive.deadline());
     tokio::pin!(idle);
 
     loop {
@@ -151,19 +157,12 @@ pub async fn handle_connection(
                 if read? == 0 {
                     return Ok(());
                 }
-                idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
-                while let Some(Message { message_type, payload }) = out.next_message(&mut inbox).await? {
-                    let message = ClientMessage::decode(message_type, &payload)?;
-                    log_message(&message);
-                    let outcome = session.handle(&message);
-                    if let Some(reply) = outcome.reply {
-                        out.reply(&reply).await?;
-                    }
-                    forward(&outcome, context, connections.as_ref());
-                    if outcome.close {
-                        out.writer.shutdown().await?;
-                        return Ok(());
-                    }
+                keepalive.heard(Instant::now());
+                idle.as_mut().reset(keepalive.deadline());
+                let client = connections.as_ref();
+                if handle_messages(&mut inbox, &mut out, &mut session, context, client, &mut keepalive).await? {
+                    out.writer.shutdown().await?;
+                    return Ok(());
                 }
                 // Follow subscription changes made by the messages above.
                 match (&subscription, session.wants_raw_advertisements()) {
@@ -216,11 +215,104 @@ pub async fn handle_connection(
             _ = flush.tick(), if !batch.is_empty() => {
                 out.advertisements(&mut batch).await?;
             }
-            () = &mut idle => {
-                info!("closing idle connection");
-                return Ok(());
-            }
+            () = &mut idle => match keepalive.expired() {
+                Idle::Ping => {
+                    debug!("pinging quiet client");
+                    out.message(&PingRequest).await?;
+                    idle.as_mut().reset(keepalive.deadline());
+                }
+                Idle::Close => {
+                    info!("closing idle connection");
+                    return Ok(());
+                }
+            },
         }
+    }
+}
+
+/// Handles the complete messages in `inbox`, and returns whether the
+/// session asked to close the connection.
+async fn handle_messages<W: AsyncWriteExt + Unpin + Send>(
+    inbox: &mut Vec<u8>,
+    out: &mut Outbound<W>,
+    session: &mut Session<'_>,
+    context: &Context,
+    client: Option<&Client>,
+    keepalive: &mut Keepalive,
+) -> Result<bool, ConnectionError> {
+    while let Some(Message {
+        message_type,
+        payload,
+    }) = out.next_message(inbox).await?
+    {
+        let message = ClientMessage::decode(message_type, &payload)?;
+        keepalive.established();
+        log_message(&message);
+        let outcome = session.handle(&message);
+        if let Some(reply) = outcome.reply {
+            out.reply(&reply).await?;
+        }
+        forward(&outcome, context, client);
+        if outcome.close {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Decides when to ping a quiet client and when to give up on it.
+#[derive(Debug)]
+struct Keepalive {
+    /// When the client last sent anything.
+    heard: Instant,
+    /// Whether it was pinged since.
+    pinged: bool,
+    /// Whether a message got through, which means any encryption handshake
+    /// is done and the client can be pinged.
+    established: bool,
+}
+
+/// What to do with a client that has been quiet until the deadline.
+#[derive(Debug, PartialEq, Eq)]
+enum Idle {
+    /// Ping it, and wait for an answer until the next deadline.
+    Ping,
+    /// Close the connection.
+    Close,
+}
+
+impl Keepalive {
+    const fn new(now: Instant) -> Self {
+        Self {
+            heard: now,
+            pinged: false,
+            established: false,
+        }
+    }
+
+    /// Records that the client sent something at `now`.
+    const fn heard(&mut self, now: Instant) {
+        self.heard = now;
+        self.pinged = false;
+    }
+
+    /// Records that a message got through.
+    const fn established(&mut self) {
+        self.established = true;
+    }
+
+    /// When the client will have been quiet for too long.
+    fn deadline(&self) -> Instant {
+        self.heard + if self.pinged { IDLE_TIMEOUT } else { KEEPALIVE }
+    }
+
+    /// Decides what to do once the deadline passes.
+    const fn expired(&mut self) -> Idle {
+        if self.pinged || !self.established {
+            return Idle::Close;
+        }
+        self.pinged = true;
+        Idle::Ping
     }
 }
 
@@ -513,6 +605,39 @@ mod tests {
     use bleproxy_protocol::wire::Encode as _;
 
     use super::*;
+
+    #[test]
+    fn pings_quiet_clients_before_closing() {
+        let start = Instant::now();
+        let mut keepalive = Keepalive::new(start);
+        keepalive.established();
+        assert_eq!(keepalive.deadline(), start + KEEPALIVE);
+        assert_eq!(keepalive.expired(), Idle::Ping);
+        // The ping extends the wait, counted from when the client was heard.
+        assert_eq!(keepalive.deadline(), start + IDLE_TIMEOUT);
+        assert_eq!(keepalive.expired(), Idle::Close);
+    }
+
+    #[test]
+    fn hearing_from_the_client_restarts_the_wait() {
+        let start = Instant::now();
+        let mut keepalive = Keepalive::new(start);
+        keepalive.established();
+        assert_eq!(keepalive.expired(), Idle::Ping);
+        let answered = start + KEEPALIVE + Duration::from_secs(1);
+        keepalive.heard(answered);
+        assert_eq!(keepalive.deadline(), answered + KEEPALIVE);
+        assert_eq!(keepalive.expired(), Idle::Ping);
+    }
+
+    #[test]
+    fn closes_connections_that_never_got_going() {
+        // Before any message, the encryption handshake may still be
+        // pending, so there is no way to ping.
+        let mut keepalive = Keepalive::new(Instant::now());
+        keepalive.heard(Instant::now());
+        assert_eq!(keepalive.expired(), Idle::Close);
+    }
 
     #[test]
     fn payload_buffer_starts_with_room_for_a_full_batch() {
