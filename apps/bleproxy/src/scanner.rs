@@ -18,7 +18,7 @@ pub const SCANNING_SWITCH: ListEntitiesSwitchResponse<'static> = ListEntitiesSwi
     object_id: "ble_scanning",
     key: 4,
     name: "BLE Scanning",
-    icon: "mdi:bluetooth-searching",
+    icon: "mdi:bluetooth-audio",
     entity_category: entity_category::CONFIG,
 };
 

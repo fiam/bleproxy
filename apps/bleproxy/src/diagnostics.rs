@@ -43,7 +43,7 @@ pub const SENSORS: [ListEntitiesSensorResponse<'static>; 2] = [
         object_id: "advertisements",
         key: ADVERTISEMENTS,
         name: "Advertisements",
-        icon: "mdi:bluetooth-searching",
+        icon: "mdi:bluetooth-transfer",
         unit_of_measurement: "adv",
         accuracy_decimals: 0,
         state_class: sensor_state_class::TOTAL_INCREASING,
