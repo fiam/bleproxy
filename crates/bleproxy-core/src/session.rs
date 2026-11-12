@@ -11,7 +11,8 @@
 //! the free connection slots once [`Session::wants_connections_free`],
 //! itself. The platform's own entities, such as diagnostic sensors, are
 //! listed when [`Outcome::list_entities`] says so, and their states sent
-//! once [`Session::wants_states`].
+//! once [`Session::wants_states`]. Commands for them arrive as
+//! [`Outcome::switch`].
 
 use bleproxy_protocol::Message;
 use bleproxy_protocol::wire::{Encode, EncodeError};
@@ -162,6 +163,17 @@ pub struct Outcome<'a, 'm> {
     /// Whether to describe the platform's entities before sending `reply`,
     /// which ends the list.
     pub list_entities: bool,
+    /// A switch the client wants turned on or off.
+    pub switch: Option<SwitchCommand>,
+}
+
+/// A client's request to turn one of the platform's switches on or off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwitchCommand {
+    /// The switch's key, as listed.
+    pub key: u32,
+    /// Whether to turn it on.
+    pub state: bool,
 }
 
 impl<'a> Outcome<'a, '_> {
@@ -171,6 +183,7 @@ impl<'a> Outcome<'a, '_> {
         scan_mode: None,
         connection: None,
         list_entities: false,
+        switch: None,
     };
     const CLOSE: Self = Self {
         close: true,
@@ -290,6 +303,10 @@ impl<'a> Session<'a> {
                 self.states = true;
                 Outcome::NOTHING
             }
+            &ClientMessage::SwitchCommand { key, state } => Outcome {
+                switch: Some(SwitchCommand { key, state }),
+                ..Outcome::NOTHING
+            },
             ClientMessage::SubscribeBluetoothLeAdvertisements { flags } => {
                 // Only the raw format is implemented; it is the one clients
                 // request when RAW_ADVERTISEMENTS is advertised.
@@ -544,6 +561,19 @@ mod tests {
         assert!(session.wants_states());
         // Other messages don't ask for entities.
         assert!(!session.handle(&ClientMessage::Ping).list_entities);
+
+        let outcome = session.handle(&ClientMessage::SwitchCommand {
+            key: 4,
+            state: false,
+        });
+        assert_eq!(
+            outcome.switch,
+            Some(SwitchCommand {
+                key: 4,
+                state: false
+            })
+        );
+        assert_eq!((outcome.reply, outcome.close), (None, false));
     }
 
     #[test]
