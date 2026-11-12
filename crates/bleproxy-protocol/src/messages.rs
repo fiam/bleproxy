@@ -38,6 +38,8 @@ pub mod message_type {
     pub const LIST_ENTITIES_REQUEST: u16 = 11;
     /// [`ListEntitiesSensorResponse`](super::ListEntitiesSensorResponse).
     pub const LIST_ENTITIES_SENSOR_RESPONSE: u16 = 16;
+    /// [`ListEntitiesSwitchResponse`](super::ListEntitiesSwitchResponse).
+    pub const LIST_ENTITIES_SWITCH_RESPONSE: u16 = 17;
     /// [`ListEntitiesTextSensorResponse`](super::ListEntitiesTextSensorResponse).
     pub const LIST_ENTITIES_TEXT_SENSOR_RESPONSE: u16 = 18;
     /// [`ListEntitiesDoneResponse`](super::ListEntitiesDoneResponse).
@@ -46,10 +48,14 @@ pub mod message_type {
     pub const SUBSCRIBE_STATES_REQUEST: u16 = 20;
     /// [`SensorStateResponse`](super::SensorStateResponse).
     pub const SENSOR_STATE_RESPONSE: u16 = 25;
+    /// [`SwitchStateResponse`](super::SwitchStateResponse).
+    pub const SWITCH_STATE_RESPONSE: u16 = 26;
     /// [`TextSensorStateResponse`](super::TextSensorStateResponse).
     pub const TEXT_SENSOR_STATE_RESPONSE: u16 = 27;
     /// [`ClientMessage::SubscribeLogs`](super::ClientMessage::SubscribeLogs).
     pub const SUBSCRIBE_LOGS_REQUEST: u16 = 28;
+    /// [`ClientMessage::SwitchCommand`](super::ClientMessage::SwitchCommand).
+    pub const SWITCH_COMMAND_REQUEST: u16 = 33;
     /// [`ClientMessage::SubscribeHomeassistantServices`](super::ClientMessage::SubscribeHomeassistantServices).
     pub const SUBSCRIBE_HOMEASSISTANT_SERVICES_REQUEST: u16 = 34;
     /// [`ClientMessage::SubscribeHomeAssistantStates`](super::ClientMessage::SubscribeHomeAssistantStates).
@@ -321,6 +327,13 @@ pub enum ClientMessage<'a> {
         /// One of the [`bluetooth_scanner_mode`] values.
         mode: u32,
     },
+    /// Turns a switch on or off.
+    SwitchCommand {
+        /// The switch's [`ListEntitiesSwitchResponse::key`].
+        key: u32,
+        /// Whether to turn it on.
+        state: bool,
+    },
     /// A message type this crate does not model.
     Unknown(u16),
 }
@@ -412,6 +425,18 @@ impl<'a> ClientMessage<'a> {
                     }
                 }
                 Self::BluetoothScannerSetMode { mode }
+            }
+            t::SWITCH_COMMAND_REQUEST => {
+                let (mut key, mut state) = (0, false);
+                for field in Fields::new(payload) {
+                    let field = field?;
+                    match field.number {
+                        1 => key = field.as_fixed32()?,
+                        2 => state = field.as_bool()?,
+                        _ => {}
+                    }
+                }
+                Self::SwitchCommand { key, state }
             }
             other => Self::Unknown(other),
         })
@@ -681,6 +706,57 @@ impl Encode for ListEntitiesTextSensorResponse<'_> {
 
 impl Message for ListEntitiesTextSensorResponse<'_> {
     const TYPE: u16 = message_type::LIST_ENTITIES_TEXT_SENSOR_RESPONSE;
+}
+
+/// Describes a switch, in answer to [`ClientMessage::ListEntities`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ListEntitiesSwitchResponse<'a> {
+    /// Identifier, unique among the device's switches. Clients derive the
+    /// entity's identity from it.
+    pub object_id: &'a str,
+    /// Key that states and commands refer to.
+    pub key: u32,
+    /// Display name.
+    pub name: &'a str,
+    /// Icon, such as `mdi:toggle-switch`.
+    pub icon: &'a str,
+    /// One of the [`entity_category`] values.
+    pub entity_category: u32,
+}
+
+impl Encode for ListEntitiesSwitchResponse<'_> {
+    fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+        e.string(1, self.object_id)?;
+        e.fixed32(2, self.key)?;
+        e.string(3, self.name)?;
+        e.string(5, self.icon)?;
+        e.uint32(8, self.entity_category)
+    }
+}
+
+impl Message for ListEntitiesSwitchResponse<'_> {
+    const TYPE: u16 = message_type::LIST_ENTITIES_SWITCH_RESPONSE;
+}
+
+/// A switch's state, sent once the client subscribed to states, and
+/// whenever it changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SwitchStateResponse {
+    /// The switch's [`ListEntitiesSwitchResponse::key`].
+    pub key: u32,
+    /// Whether it is on.
+    pub state: bool,
+}
+
+impl Encode for SwitchStateResponse {
+    fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+        e.fixed32(1, self.key)?;
+        e.bool(2, self.state)
+    }
+}
+
+impl Message for SwitchStateResponse {
+    const TYPE: u16 = message_type::SWITCH_STATE_RESPONSE;
 }
 
 /// A numeric sensor's state, sent once the client subscribed to states.
@@ -1278,6 +1354,54 @@ mod tests {
         );
         assert_eq!(ListEntitiesSensorResponse::TYPE, 16);
         assert_eq!(ListEntitiesTextSensorResponse::TYPE, 18);
+    }
+
+    #[test]
+    fn encodes_switches() {
+        let scanning = ListEntitiesSwitchResponse {
+            object_id: "ble_scanning",
+            key: 4,
+            name: "BLE Scanning",
+            icon: "mdi:bluetooth-searching",
+            entity_category: entity_category::CONFIG,
+        };
+        assert_encodes(
+            &scanning,
+            "0a0c626c655f7363616e6e696e6715040000001a0c424c45205363616e6e696e672a176d64693a626c75\
+             65746f6f74682d736561726368696e674001",
+        );
+        let on = SwitchStateResponse {
+            key: 4,
+            state: true,
+        };
+        assert_encodes(&on, "0d040000001001");
+        let off = SwitchStateResponse {
+            key: 4,
+            state: false,
+        };
+        assert_encodes(&off, "0d04000000");
+        assert_eq!(ListEntitiesSwitchResponse::TYPE, 17);
+        assert_eq!(SwitchStateResponse::TYPE, 26);
+    }
+
+    #[test]
+    fn decodes_switch_commands() {
+        let cases = [
+            ("0d040000001001", 4, true),
+            ("0d04000000", 4, false),
+            // Sub-device IDs are ignored.
+            ("0defbeadde10011807", 0xDEAD_BEEF, true),
+        ];
+        for (payload, key, state) in cases {
+            let (payload, len) = hex(payload);
+            assert_eq!(
+                ClientMessage::decode(33, &payload[..len]),
+                Ok(ClientMessage::SwitchCommand { key, state })
+            );
+        }
+        // The key is a fixed32; a varint there is malformed.
+        let (payload, len) = hex("0804");
+        assert!(ClientMessage::decode(33, &payload[..len]).is_err());
     }
 
     #[test]

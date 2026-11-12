@@ -328,6 +328,18 @@ impl<'a> Field<'a> {
         u32::try_from(self.as_u64()?).map_err(|_| DecodeError::OutOfRange(self.number))
     }
 
+    /// Interprets the field as a `fixed32`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the field is not a 32-bit value.
+    pub const fn as_fixed32(&self) -> Result<u32, DecodeError> {
+        match self.value {
+            Value::Fixed32(value) => Ok(value),
+            _ => Err(DecodeError::UnexpectedWireType(self.number)),
+        }
+    }
+
     /// Interprets the field as a `uint64`.
     ///
     /// # Errors
