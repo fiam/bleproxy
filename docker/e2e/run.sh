@@ -14,8 +14,9 @@ dbus-daemon --system --fork
 
 # Each run gets a fresh mock BlueZ: both scan modes, then active scanning
 # over an encrypted API with an address filter. Every run also connects to
-# a device.
-for run in active passive "active encrypted filtered"; do
+# a device. The last run checks that passive scanning falls back to active
+# without BlueZ's advertisement monitors.
+for run in active passive "active encrypted filtered" "passive nomonitor"; do
     python3 -m dbusmock --system --template bluez5 &
     mock=$!
     for _ in $(seq 50); do

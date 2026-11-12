@@ -298,22 +298,10 @@ async def check_scanning_started(bus, mode, pid):
         assert (0, 0x01, b"\x06") in patterns, patterns
 
 
-async def main(binary, mode, encrypted, filtered):
-    step(
-        f"testing {mode} scanning"
-        + (" with encryption" if encrypted else "")
-        + (" and an address filter" if filtered else "")
-    )
-    bus, mock = mock_bluez()
-    key = base64.b64encode(os.urandom(32)).decode() if encrypted else None
-    env = dict(os.environ)
-    if key:
-        env["BLEPROXY_ENCRYPTION_KEY"] = key
-    if filtered:
-        env["BLEPROXY_ALLOW_ADDRESS"] = f"{DEVICE_ADDRESS},{SECOND_ADDRESS}"
+def start_proxy(binary, mode, env):
     step("starting bleproxy")
     # Unprivileged, as in deployments: the bus policy must let it in.
-    proxy = subprocess.Popen(
+    return subprocess.Popen(
         [
             binary,
             "--no-mdns",
@@ -329,6 +317,71 @@ async def main(binary, mode, encrypted, filtered):
         extra_groups=[],
         env=env,
     )
+
+
+def stop_proxy(proxy):
+    step("stopping bleproxy")
+    proxy.send_signal(signal.SIGTERM)
+    code = proxy.wait(TIMEOUT)
+    assert code == 0, f"bleproxy exited with {code}"
+
+
+async def check_passive_fallback(binary):
+    """Without advertisement monitors, passive scanning falls back to active."""
+    step("testing passive scanning without advertisement monitor support")
+    bus, mock = mock_bluez()
+    # Like BlueZ releases that only offer monitors with --experimental.
+    adapter = dbus.Interface(bus.get_object("org.bluez", "/org/bluez/hci0"), MOCK)
+    adapter.AddMethod(
+        "org.bluez.AdvertisementMonitorManager1",
+        "RegisterMonitor",
+        "o",
+        "",
+        "raise dbus.exceptions.DBusException('no monitors', "
+        "name='org.freedesktop.DBus.Error.UnknownMethod')",
+    )
+    proxy = start_proxy(binary, "passive", dict(os.environ))
+    try:
+        client = await connect(None)
+        states = []
+        client.subscribe_bluetooth_scanner_state(states.append)
+        received = []
+        client.subscribe_bluetooth_le_raw_advertisements(
+            lambda response: received.extend(response.advertisements)
+        )
+        step("checking that it scans actively and says so")
+        await wait_for(
+            states,
+            lambda s: s.state == BluetoothScannerState.RUNNING
+            and s.mode == BluetoothScannerMode.ACTIVE
+            and s.configured_mode == BluetoothScannerMode.PASSIVE,
+            "the scanner running in active mode",
+        )
+        calls = adapter_calls(bus)
+        assert "RegisterMonitor" in calls and "StartDiscovery" in calls, calls
+        address = int(DEVICE_ADDRESS.replace(":", ""), 16)
+        mock.AddDevice("hci0", DEVICE_ADDRESS, "ATC_1122")
+        await wait_for(received, lambda a: a.address == address, "the device")
+        await client.disconnect()
+    finally:
+        stop_proxy(proxy)
+    step("passive fallback passed")
+
+
+async def main(binary, mode, encrypted, filtered):
+    step(
+        f"testing {mode} scanning"
+        + (" with encryption" if encrypted else "")
+        + (" and an address filter" if filtered else "")
+    )
+    bus, mock = mock_bluez()
+    key = base64.b64encode(os.urandom(32)).decode() if encrypted else None
+    env = dict(os.environ)
+    if key:
+        env["BLEPROXY_ENCRYPTION_KEY"] = key
+    if filtered:
+        env["BLEPROXY_ALLOW_ADDRESS"] = f"{DEVICE_ADDRESS},{SECOND_ADDRESS}"
+    proxy = start_proxy(binary, mode, env)
     try:
         if encrypted:
             step("checking that wrong keys and plaintext clients are rejected")
@@ -438,13 +491,13 @@ async def main(binary, mode, encrypted, filtered):
 
         await check_connections(bus, client, path, flags)
     finally:
-        step("stopping bleproxy")
-        proxy.send_signal(signal.SIGTERM)
-        code = proxy.wait(TIMEOUT)
-    assert code == 0, f"bleproxy exited with {code}"
+        stop_proxy(proxy)
     step(f"{mode} scanning passed")
 
 
 if __name__ == "__main__":
     flags = sys.argv[3:]
-    asyncio.run(main(sys.argv[1], sys.argv[2], "encrypted" in flags, "filtered" in flags))
+    if "nomonitor" in flags:
+        asyncio.run(check_passive_fallback(sys.argv[1]))
+    else:
+        asyncio.run(main(sys.argv[1], sys.argv[2], "encrypted" in flags, "filtered" in flags))
