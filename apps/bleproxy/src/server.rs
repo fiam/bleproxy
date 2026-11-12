@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use bleproxy_core::Advertisement;
 use bleproxy_core::connection::ConnectionRequest;
+use bleproxy_core::scanner::ScannerStatus;
 use bleproxy_core::session::{Outcome, Reply, Session};
 use bleproxy_protocol::wire::{DecodeError, EncodeError};
 use bleproxy_protocol::{
@@ -26,6 +27,7 @@ use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::Identity;
 use crate::connections::{Client, ConnectionsHandle, Event, Service, Slots};
+use crate::diagnostics::{self, Diagnostics, STATE_INTERVAL};
 use crate::encryption::EncryptionKey;
 use crate::scanner::ScannerHandle;
 use crate::transport::{Message, Transport, TransportError};
@@ -77,6 +79,8 @@ pub struct Context {
     pub advertisements: broadcast::Sender<Advertisement>,
     /// The scanner, if clients may follow its state and switch its mode.
     pub scanner: Option<ScannerHandle>,
+    /// What the proxy's diagnostic sensors report.
+    pub diagnostics: Arc<Diagnostics>,
     /// Key that encrypts every connection, or `None` for plaintext.
     pub encryption: Option<EncryptionKey>,
     /// The connection manager, if clients may connect to devices.
@@ -127,6 +131,10 @@ pub async fn handle_connection(
     context: &Context,
 ) -> Result<(), ConnectionError> {
     stream.set_nodelay(true)?;
+    let _connected = stream
+        .peer_addr()
+        .ok()
+        .map(|peer| context.diagnostics.connect(peer.ip()));
     let (mut reader, writer) = stream.into_split();
     let identity = &context.identity;
     let transport = context
@@ -147,6 +155,8 @@ pub async fn handle_connection(
     let mut batch = Vec::with_capacity(BATCH_SIZE);
     let mut flush = tokio::time::interval(BATCH_INTERVAL);
     flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut refresh = tokio::time::interval_at(Instant::now() + STATE_INTERVAL, STATE_INTERVAL);
+    refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut keepalive = Keepalive::new(Instant::now());
     let idle = tokio::time::sleep_until(keepalive.deadline());
     tokio::pin!(idle);
@@ -165,24 +175,7 @@ pub async fn handle_connection(
                     return Ok(());
                 }
                 // Follow subscription changes made by the messages above.
-                match (&subscription, session.wants_raw_advertisements()) {
-                    (None, true) => {
-                        subscription = Some(context.advertisements.subscribe());
-                        // Like ESPHome, report the scanner's state to new
-                        // subscribers, then follow its changes.
-                        if let Some(status) = &mut scanner_status {
-                            let current = *status.borrow_and_update();
-                            if let Some(reply) = session.scanner_state(current) {
-                                out.reply(&reply).await?;
-                            }
-                        }
-                    }
-                    (Some(_), false) => {
-                        subscription = None;
-                        batch.clear();
-                    }
-                    _ => {}
-                }
+                follow_advertisements(&session, context, &mut subscription, &mut batch, scanner_status.as_mut(), &mut out).await?;
                 // Report the free slots to new subscribers, then follow them.
                 if slots.is_none() && session.wants_connections_free()
                     && let Some(handle) = &context.connections
@@ -215,6 +208,7 @@ pub async fn handle_connection(
             _ = flush.tick(), if !batch.is_empty() => {
                 out.advertisements(&mut batch).await?;
             }
+            _ = refresh.tick(), if session.wants_states() => out.states(&context.diagnostics).await?,
             () = &mut idle => match keepalive.expired() {
                 Idle::Ping => {
                     debug!("pinging quiet client");
@@ -228,6 +222,36 @@ pub async fn handle_connection(
             },
         }
     }
+}
+
+/// Starts or stops forwarding advertisements as the client asked. Like
+/// ESPHome, reports the scanner's state to new subscribers, who then
+/// follow its changes.
+async fn follow_advertisements<W: AsyncWriteExt + Unpin + Send>(
+    session: &Session<'_>,
+    context: &Context,
+    subscription: &mut Option<broadcast::Receiver<Advertisement>>,
+    batch: &mut Vec<Advertisement>,
+    scanner_status: Option<&mut watch::Receiver<ScannerStatus>>,
+    out: &mut Outbound<W>,
+) -> Result<(), ConnectionError> {
+    match (&subscription, session.wants_raw_advertisements()) {
+        (None, true) => {
+            *subscription = Some(context.advertisements.subscribe());
+            if let Some(status) = scanner_status {
+                let current = *status.borrow_and_update();
+                if let Some(reply) = session.scanner_state(current) {
+                    out.reply(&reply).await?;
+                }
+            }
+        }
+        (Some(_), false) => {
+            *subscription = None;
+            batch.clear();
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Handles the complete messages in `inbox`, and returns whether the
@@ -248,9 +272,17 @@ async fn handle_messages<W: AsyncWriteExt + Unpin + Send>(
         let message = ClientMessage::decode(message_type, &payload)?;
         keepalive.established();
         log_message(&message);
+        let subscribed = session.wants_states();
         let outcome = session.handle(&message);
+        if outcome.list_entities {
+            out.entities().await?;
+        }
         if let Some(reply) = outcome.reply {
             out.reply(&reply).await?;
+        }
+        // Like ESPHome, send the current states to new subscribers.
+        if !subscribed && session.wants_states() {
+            out.states(&context.diagnostics).await?;
         }
         forward(&outcome, context, client);
         if outcome.close {
@@ -394,6 +426,29 @@ impl<W: AsyncWriteExt + Unpin> Outbound<W> {
     async fn reply(&mut self, reply: &Reply<'_>) -> Result<(), ConnectionError> {
         let len = reply.encode_payload(&mut self.payload)?;
         self.send(reply.message_type(), len).await
+    }
+
+    /// Describes the diagnostic sensors.
+    async fn entities(&mut self) -> Result<(), ConnectionError> {
+        for listing in &diagnostics::TEXT_SENSORS {
+            self.message(listing).await?;
+        }
+        for listing in &diagnostics::SENSORS {
+            self.message(listing).await?;
+        }
+        Ok(())
+    }
+
+    /// Sends the diagnostic sensors' states.
+    async fn states(&mut self, diagnostics: &Diagnostics) -> Result<(), ConnectionError> {
+        let uptime = diagnostics.uptime();
+        for state in Diagnostics::text_states(&uptime) {
+            self.message(&state).await?;
+        }
+        for state in diagnostics.sensor_states() {
+            self.message(&state).await?;
+        }
+        Ok(())
     }
 
     async fn advertisements(

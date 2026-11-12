@@ -75,6 +75,7 @@ impl Proxy {
             identity: Arc::new(identity),
             advertisements: advertisements.clone(),
             scanner,
+            diagnostics: Arc::default(),
             encryption: None,
             connections,
         };
@@ -166,10 +167,63 @@ async fn handshake_and_device_info() {
         .map(|field| field.as_u32().expect("flags"));
     assert_eq!(flags, Some(0b10_0001));
 
-    proxy.send(11, &[]).await;
-    assert_eq!(proxy.receive().await.0, 19, "ListEntitiesDoneResponse");
     proxy.send(7, &[]).await;
     assert_eq!(proxy.receive().await.0, 8, "PingResponse");
+}
+
+#[tokio::test]
+async fn reports_diagnostic_sensors() {
+    let mut proxy = Proxy::start().await;
+    proxy.hello().await;
+
+    proxy.send(11, &[]).await;
+    let mut listed = Vec::new();
+    loop {
+        let (message_type, payload) = proxy.receive().await;
+        if message_type == 19 {
+            break;
+        }
+        let listing = fields(&payload);
+        // Text sensors (18) and sensors (16) number the field differently.
+        let category = if message_type == 18 { 7 } else { 13 };
+        let category = listing
+            .iter()
+            .find(|field| field.number == category)
+            .and_then(|field| field.as_u32().ok());
+        assert_eq!(category, Some(2), "diagnostic entity category");
+        listed.push((message_type, string_field(&listing, 1).to_owned()));
+    }
+    let listed: Vec<(u16, &str)> = listed.iter().map(|(t, id)| (*t, id.as_str())).collect();
+    assert_eq!(
+        listed,
+        [
+            (18, "uptime"),
+            (16, "advertisements"),
+            (16, "connected_clients")
+        ]
+    );
+
+    // Subscribing sends the current states.
+    proxy.send(20, &[]).await;
+    let (message_type, payload) = proxy.receive().await;
+    assert_eq!(message_type, 27, "TextSensorStateResponse");
+    assert!(string_field(&fields(&payload), 2).ends_with('s'));
+    let mut sensors = Vec::new();
+    for _ in 0..2 {
+        let (message_type, payload) = proxy.receive().await;
+        assert_eq!(message_type, 25, "SensorStateResponse");
+        let state = fields(&payload)
+            .iter()
+            .find(|field| field.number == 2)
+            .map(|field| match field.value {
+                Value::Fixed32(bits) => f32::from_bits(bits),
+                ref other => panic!("unexpected state {other:?}"),
+            })
+            .unwrap_or_default();
+        sensors.push(state);
+    }
+    // Nothing was published, and this test is the one client.
+    assert_eq!(sensors, [0.0, 1.0]);
 }
 
 #[tokio::test]

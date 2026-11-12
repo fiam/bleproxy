@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use bleproxy::diagnostics::Diagnostics;
 use bleproxy::encryption::EncryptionKey;
 use bleproxy::identity::validate_name;
 use bleproxy::mdns::Announcement;
@@ -155,6 +156,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         (None, None) => None,
     };
     let (advertisements, _) = broadcast::channel(1024);
+    let diagnostics = Arc::new(Diagnostics::new());
+    tokio::spawn(Arc::clone(&diagnostics).count_advertisements(advertisements.subscribe()));
 
     #[cfg(target_os = "linux")]
     let (bluetooth_mac, scanner, connections) = {
@@ -230,6 +233,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         identity,
         advertisements,
         scanner,
+        diagnostics,
         encryption,
         connections,
     };
