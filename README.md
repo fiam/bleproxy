@@ -131,6 +131,7 @@ Every option is a command-line flag and a `BLEPROXY_*` environment variable:
 | `--adapter` | `BLEPROXY_ADAPTER` | `hci0` | Bluetooth adapter to scan with |
 | `--scan-mode` | `BLEPROXY_SCAN_MODE` | `active` | Scan mode to start in: `active` or `passive` (see below) |
 | `--connection-slots` | `BLEPROXY_CONNECTION_SLOTS` | `3` | Devices Home Assistant may connect to at once; `0` turns connections off |
+| `--allow-address` | `BLEPROXY_ALLOW_ADDRESS` | every device | Only forward and connect to this device; repeat the flag or separate addresses with commas for several |
 | `--encryption-key` | `BLEPROXY_ENCRYPTION_KEY` | none | Base64 key that encrypts the API (see below) |
 | `--encryption-key-file` | `BLEPROXY_ENCRYPTION_KEY_FILE` | none | File holding that key, to keep it out of the environment |
 | `--mac` | `BLEPROXY_MAC` | the adapter's address | Address identifying the proxy in Home Assistant |
@@ -156,6 +157,12 @@ so raise `--connection-slots` if connections queue up, or set it to `0` to
 only forward advertisements. bleproxy uses BlueZ's own connections, so
 devices connected through the proxy also show up as connected in
 `bluetoothctl`, and BlueZ's pairing data applies.
+
+**Address filter.** A proxy placed next to one device, say a scale in the
+bathroom, can be limited to it with `--allow-address 5C:CA:D3:BA:BA:CC`.
+Home Assistant then only receives that device's advertisements, and
+connecting to any other device fails. Without the flag every device is
+forwarded.
 
 **Encryption.** With a key, the API is encrypted exactly like an ESPHome
 device with `api: encryption: key:` (Noise, with a pre-shared key). Home
