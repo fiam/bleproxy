@@ -106,6 +106,45 @@ pub async fn adapter_address(adapter: &str) -> Result<BdAddr, BluezError> {
     })
 }
 
+/// Returns the names BlueZ knows for devices `adapter` has seen. BlueZ
+/// remembers them across restarts, so a device that is asleep now may
+/// still have one.
+///
+/// # Errors
+///
+/// Returns an error if BlueZ is unreachable.
+pub async fn known_names(adapter: &str) -> Result<HashMap<BdAddr, String>, BluezError> {
+    let connection = Connection::system().await?;
+    let objects: ManagedObjects = connection
+        .call_method(
+            Some(BLUEZ),
+            "/",
+            Some(OBJECT_MANAGER),
+            "GetManagedObjects",
+            &(),
+        )
+        .await?
+        .body()
+        .deserialize()?;
+    Ok(names(&objects, &adapter_path(adapter)))
+}
+
+/// Picks the named devices under the adapter at `adapter_path` out of
+/// `objects`.
+fn names(objects: &ManagedObjects, adapter_path: &str) -> HashMap<BdAddr, String> {
+    let devices = format!("{adapter_path}/");
+    objects
+        .iter()
+        .filter(|(path, _)| path.as_str().starts_with(&devices))
+        .filter_map(|(_, interfaces)| {
+            let properties = interfaces.get(DEVICE)?;
+            let address = string(properties.get("Address")?)?.parse().ok()?;
+            let name = string(properties.get("Name")?)?;
+            Some((address, name))
+        })
+        .collect()
+}
+
 /// Scans with `adapter` forever, publishing advertisements from devices
 /// `filter` allows to `sender`.
 ///
@@ -689,6 +728,41 @@ mod tests {
 
     fn variant(value: impl Into<Variant<'static>>) -> OwnedVariant {
         OwnedVariant::try_from(&Variant::new(value.into())).unwrap()
+    }
+
+    #[test]
+    fn finds_names_of_the_adapters_devices() {
+        let device = |address: &str, name: Option<&str>| {
+            let mut properties =
+                HashMap::from([("Address".to_owned(), variant(address.to_owned()))]);
+            if let Some(name) = name {
+                properties.insert("Name".to_owned(), variant(name.to_owned()));
+            }
+            HashMap::from([(DEVICE.to_owned(), properties)])
+        };
+        let path = |path: &str| OwnedObjectPath::try_from(path.to_owned()).unwrap();
+        let objects: ManagedObjects = HashMap::from([
+            (
+                path("/org/bluez/hci0/dev_5C_CA_D3_BA_BA_CC"),
+                device("5C:CA:D3:BA:BA:CC", Some("MIBFS")),
+            ),
+            // No name yet.
+            (
+                path("/org/bluez/hci0/dev_A4_C1_38_00_11_22"),
+                device("A4:C1:38:00:11:22", None),
+            ),
+            // Another adapter's device.
+            (
+                path("/org/bluez/hci1/dev_A4_C1_38_00_33_44"),
+                device("A4:C1:38:00:33:44", Some("ATC_3344")),
+            ),
+            (path("/org/bluez/hci0"), HashMap::new()),
+        ]);
+        let scale = BdAddr::new([0x5C, 0xCA, 0xD3, 0xBA, 0xBA, 0xCC]);
+        assert_eq!(
+            names(&objects, "/org/bluez/hci0"),
+            HashMap::from([(scale, "MIBFS".to_owned())])
+        );
     }
 
     fn device_properties() -> HashMap<String, OwnedVariant> {

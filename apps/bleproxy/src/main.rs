@@ -67,7 +67,8 @@ struct Cli {
     /// this address. Repeat it (or separate addresses with commas) to
     /// allow several devices. Each allowed device gets signal strength and
     /// last seen sensors, named after the label given with `=NAME`, or else
-    /// the address. [default: every device]
+    /// the name BlueZ knows for it when bleproxy starts, or else the
+    /// address. [default: every device]
     #[cfg(target_os = "linux")]
     #[arg(
         long = "allow-address",
@@ -277,17 +278,7 @@ async fn start_bluetooth(
     if filter.is_restricted() {
         info!(devices = %filter, "only forwarding allowed devices");
     }
-    let devices = cli
-        .allow_addresses
-        .iter()
-        .map(|device| {
-            let name = device
-                .label
-                .clone()
-                .unwrap_or_else(|| device.address.to_string());
-            (device.address, name)
-        })
-        .collect();
+    let devices = name_devices(&cli.adapter, &cli.allow_addresses).await;
     let config = vec![
         format!("Bluetooth adapter: {} ({address})", cli.adapter),
         format!("Scan mode: {:?}", cli.scan_mode),
@@ -316,6 +307,50 @@ async fn start_bluetooth(
         devices,
         config,
     })
+}
+
+/// Names the allowed devices for their sensors: by label, by the name
+/// BlueZ knows, or by address. Names are fixed from here on, since Home
+/// Assistant would see a renamed sensor as a new one.
+#[cfg(target_os = "linux")]
+async fn name_devices(
+    adapter: &str,
+    devices: &[bleproxy::filter::AllowedDevice],
+) -> Vec<(BdAddr, String)> {
+    let known = if devices.iter().any(|device| device.label.is_none()) {
+        bleproxy::bluez::known_names(adapter)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, "cannot look up device names; naming devices by address");
+                std::collections::HashMap::new()
+            })
+    } else {
+        std::collections::HashMap::new()
+    };
+    devices
+        .iter()
+        .map(|device| {
+            let address = device.address;
+            let name = match (&device.label, known.get(&address)) {
+                (Some(label), _) => label.clone(),
+                (None, Some(name)) => {
+                    info!(
+                        %address,
+                        name, "naming device after its Bluetooth name; label it to keep the name"
+                    );
+                    name.clone()
+                }
+                (None, None) => {
+                    info!(
+                        %address,
+                        "naming device after its address; label it to choose a name"
+                    );
+                    address.to_string()
+                }
+            };
+            (address, name)
+        })
+        .collect()
 }
 
 /// Serves the API without Bluetooth, which this platform lacks so far.
