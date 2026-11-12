@@ -35,6 +35,7 @@ pub const TEXT_SENSORS: [ListEntitiesTextSensorResponse<'static>; 1] =
         name: "Uptime",
         icon: "mdi:clock-outline",
         entity_category: entity_category::DIAGNOSTIC,
+        device_class: "",
     }];
 
 /// The numeric sensors, as listed to clients.
@@ -46,6 +47,7 @@ pub const SENSORS: [ListEntitiesSensorResponse<'static>; 2] = [
         icon: "mdi:bluetooth-transfer",
         unit_of_measurement: "adv",
         accuracy_decimals: 0,
+        device_class: "",
         state_class: sensor_state_class::TOTAL_INCREASING,
         entity_category: entity_category::DIAGNOSTIC,
     },
@@ -56,6 +58,7 @@ pub const SENSORS: [ListEntitiesSensorResponse<'static>; 2] = [
         icon: "mdi:account-network",
         unit_of_measurement: "",
         accuracy_decimals: 0,
+        device_class: "",
         state_class: sensor_state_class::MEASUREMENT,
         entity_category: entity_category::DIAGNOSTIC,
     },
@@ -134,10 +137,12 @@ impl Diagnostics {
             SensorStateResponse {
                 key: ADVERTISEMENTS,
                 state: self.advertisements.load(Ordering::Relaxed) as f32,
+                missing_state: false,
             },
             SensorStateResponse {
                 key: CONNECTED_CLIENTS,
                 state: clients as f32,
+                missing_state: false,
             },
         ]
     }
@@ -149,6 +154,7 @@ impl Diagnostics {
         [TextSensorStateResponse {
             key: UPTIME,
             state: uptime,
+            missing_state: false,
         }]
     }
 

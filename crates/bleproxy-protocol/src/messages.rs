@@ -694,6 +694,9 @@ pub struct ListEntitiesSensorResponse<'a> {
     pub unit_of_measurement: &'a str,
     /// Decimal places to show.
     pub accuracy_decimals: i32,
+    /// What the sensor measures, as one of Home Assistant's sensor device
+    /// classes, such as `signal_strength`; empty for none.
+    pub device_class: &'a str,
     /// One of the [`sensor_state_class`] values.
     pub state_class: u32,
     /// One of the [`entity_category`] values.
@@ -708,6 +711,7 @@ impl Encode for ListEntitiesSensorResponse<'_> {
         e.string(5, self.icon)?;
         e.string(6, self.unit_of_measurement)?;
         e.int32(7, self.accuracy_decimals)?;
+        e.string(9, self.device_class)?;
         e.uint32(10, self.state_class)?;
         e.uint32(13, self.entity_category)
     }
@@ -731,6 +735,10 @@ pub struct ListEntitiesTextSensorResponse<'a> {
     pub icon: &'a str,
     /// One of the [`entity_category`] values.
     pub entity_category: u32,
+    /// What the text means, as one of Home Assistant's sensor device
+    /// classes; `timestamp` makes clients parse it as an ISO 8601 time.
+    /// Empty for none.
+    pub device_class: &'a str,
 }
 
 impl Encode for ListEntitiesTextSensorResponse<'_> {
@@ -739,7 +747,8 @@ impl Encode for ListEntitiesTextSensorResponse<'_> {
         e.fixed32(2, self.key)?;
         e.string(3, self.name)?;
         e.string(5, self.icon)?;
-        e.uint32(7, self.entity_category)
+        e.uint32(7, self.entity_category)?;
+        e.string(8, self.device_class)
     }
 }
 
@@ -805,12 +814,15 @@ pub struct SensorStateResponse {
     pub key: u32,
     /// Its value.
     pub state: f32,
+    /// Whether there is no value yet; clients then show it as unknown.
+    pub missing_state: bool,
 }
 
 impl Encode for SensorStateResponse {
     fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
         e.fixed32(1, self.key)?;
-        e.float(2, self.state)
+        e.float(2, self.state)?;
+        e.bool(3, self.missing_state)
     }
 }
 
@@ -825,12 +837,15 @@ pub struct TextSensorStateResponse<'a> {
     pub key: u32,
     /// Its value.
     pub state: &'a str,
+    /// Whether there is no value yet; clients then show it as unknown.
+    pub missing_state: bool,
 }
 
 impl Encode for TextSensorStateResponse<'_> {
     fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
         e.fixed32(1, self.key)?;
-        e.string(2, self.state)
+        e.string(2, self.state)?;
+        e.bool(3, self.missing_state)
     }
 }
 
@@ -1380,6 +1395,7 @@ mod tests {
             icon: "mdi:bluetooth-searching",
             unit_of_measurement: "adv",
             accuracy_decimals: 0,
+            device_class: "",
             state_class: sensor_state_class::TOTAL_INCREASING,
             entity_category: entity_category::DIAGNOSTIC,
         };
@@ -1408,10 +1424,39 @@ mod tests {
             name: "Uptime",
             icon: "mdi:clock-outline",
             entity_category: entity_category::DIAGNOSTIC,
+            device_class: "",
         };
         assert_encodes(
             &uptime,
             "0a06757074696d6515010000001a06557074696d652a116d64693a636c6f636b2d6f75746c696e653802",
+        );
+        let rssi = ListEntitiesSensorResponse {
+            object_id: "scale_rssi",
+            key: 16,
+            name: "Scale RSSI",
+            unit_of_measurement: "dBm",
+            device_class: "signal_strength",
+            state_class: sensor_state_class::MEASUREMENT,
+            entity_category: entity_category::DIAGNOSTIC,
+            ..ListEntitiesSensorResponse::default()
+        };
+        assert_encodes(
+            &rssi,
+            "0a0a7363616c655f7273736915100000001a0a5363616c652052535349320364426d4a0f7369676e616c\
+             5f737472656e67746850016802",
+        );
+        let last_seen = ListEntitiesTextSensorResponse {
+            object_id: "scale_last_seen",
+            key: 17,
+            name: "Scale Last Seen",
+            entity_category: entity_category::DIAGNOSTIC,
+            device_class: "timestamp",
+            ..ListEntitiesTextSensorResponse::default()
+        };
+        assert_encodes(
+            &last_seen,
+            "0a0f7363616c655f6c6173745f7365656e15110000001a0f5363616c65204c617374205365656e380242\
+             0974696d657374616d70",
         );
         assert_eq!(ListEntitiesSensorResponse::TYPE, 16);
         assert_eq!(ListEntitiesTextSensorResponse::TYPE, 18);
@@ -1470,16 +1515,48 @@ mod tests {
         let count = SensorStateResponse {
             key: 2,
             state: 1234.0,
+            missing_state: false,
         };
         assert_encodes(&count, "0d020000001500409a44");
         // Zero is the default, so only the key is sent.
-        let none = SensorStateResponse { key: 3, state: 0.0 };
+        let none = SensorStateResponse {
+            key: 3,
+            ..SensorStateResponse::default()
+        };
         assert_encodes(&none, "0d03000000");
+        let rssi = SensorStateResponse {
+            key: 16,
+            state: -67.0,
+            missing_state: false,
+        };
+        assert_encodes(&rssi, "0d1000000015000086c2");
+        let unknown = SensorStateResponse {
+            key: 16,
+            missing_state: true,
+            ..SensorStateResponse::default()
+        };
+        assert_encodes(&unknown, "0d100000001801");
         let uptime = TextSensorStateResponse {
             key: 1,
             state: "1d 2h 3m 45s",
+            missing_state: false,
         };
         assert_encodes(&uptime, "0d01000000120c316420326820336d20343573");
+        let seen = TextSensorStateResponse {
+            key: 17,
+            state: "2026-11-12T15:55:06Z",
+            missing_state: false,
+        };
+        assert_encodes(
+            &seen,
+            "0d110000001214323032362d31312d31325431353a35353a30365a",
+        );
+        let never = TextSensorStateResponse {
+            key: 17,
+            missing_state: true,
+            ..TextSensorStateResponse::default()
+        };
+        assert_encodes(&never, "0d110000001801");
         assert_eq!(SensorStateResponse::TYPE, 25);
         assert_eq!(TextSensorStateResponse::TYPE, 27);
     }
