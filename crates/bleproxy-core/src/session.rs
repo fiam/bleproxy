@@ -165,6 +165,19 @@ pub struct Outcome<'a, 'm> {
     pub list_entities: bool,
     /// A switch the client wants turned on or off.
     pub switch: Option<SwitchCommand>,
+    /// The logs the client wants from now on, replacing any earlier
+    /// subscription.
+    pub logs: Option<LogSubscription>,
+}
+
+/// A client's request for the platform's logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogSubscription {
+    /// The most detailed [`log_level`](bleproxy_protocol::log_level) to
+    /// send.
+    pub level: u32,
+    /// Whether to log the platform's configuration now.
+    pub dump_config: bool,
 }
 
 /// A client's request to turn one of the platform's switches on or off.
@@ -184,6 +197,7 @@ impl<'a> Outcome<'a, '_> {
         connection: None,
         list_entities: false,
         switch: None,
+        logs: None,
     };
     const CLOSE: Self = Self {
         close: true,
@@ -307,6 +321,10 @@ impl<'a> Session<'a> {
                 switch: Some(SwitchCommand { key, state }),
                 ..Outcome::NOTHING
             },
+            &ClientMessage::SubscribeLogs { level, dump_config } => Outcome {
+                logs: Some(LogSubscription { level, dump_config }),
+                ..Outcome::NOTHING
+            },
             ClientMessage::SubscribeBluetoothLeAdvertisements { flags } => {
                 // Only the raw format is implemented; it is the one clients
                 // request when RAW_ADVERTISEMENTS is advertised.
@@ -333,7 +351,7 @@ impl<'a> Session<'a> {
                 connection: ConnectionRequest::from_message(message),
                 ..Outcome::NOTHING
             },
-            // No password, no logs or services to stream.
+            // No password, no services to stream.
             _ => Outcome::NOTHING,
         }
     }
@@ -363,7 +381,7 @@ impl Advertisement {
 
 #[cfg(test)]
 mod tests {
-    use bleproxy_protocol::HelloRequest;
+    use bleproxy_protocol::{HelloRequest, log_level};
 
     use super::*;
     use crate::{AddressType, AdvData, BdAddr};
@@ -574,6 +592,32 @@ mod tests {
             })
         );
         assert_eq!((outcome.reply, outcome.close), (None, false));
+    }
+
+    #[test]
+    fn leaves_logs_to_the_platform() {
+        let mut session = established();
+        let outcome = session.handle(&ClientMessage::SubscribeLogs {
+            level: log_level::DEBUG,
+            dump_config: true,
+        });
+        assert_eq!(
+            outcome,
+            Outcome {
+                logs: Some(LogSubscription {
+                    level: log_level::DEBUG,
+                    dump_config: true,
+                }),
+                ..Outcome::NOTHING
+            }
+        );
+        // Before the hello, a subscription is a protocol violation.
+        let mut session = Session::new(&IDENTITY);
+        let message = ClientMessage::SubscribeLogs {
+            level: log_level::INFO,
+            dump_config: false,
+        };
+        assert_eq!(session.handle(&message), Outcome::CLOSE);
     }
 
     #[test]
