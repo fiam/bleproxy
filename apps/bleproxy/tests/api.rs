@@ -14,6 +14,7 @@ use std::time::Duration;
 use bleproxy::connections::{
     self, Characteristic, Command, ConnectionsDriver, ConnectionsHandle, Descriptor, Event, Service,
 };
+use bleproxy::diagnostics::Diagnostics;
 use bleproxy::filter::AddressFilter;
 use bleproxy::logs::Logs;
 use bleproxy::scanner::{self, ScannerDriver, ScannerHandle};
@@ -32,6 +33,15 @@ use tokio::time::timeout;
 const MAC: BdAddr = BdAddr::new([0x02, 0x11, 0x22, 0xA1, 0xB2, 0xC3]);
 const DEADLINE: Duration = Duration::from_secs(5);
 
+/// What a test proxy offers; nothing but the API by default.
+#[derive(Default)]
+struct Setup {
+    scanner: Option<ScannerHandle>,
+    connections: Option<ConnectionsHandle>,
+    logs: Arc<Logs>,
+    diagnostics: Arc<Diagnostics>,
+}
+
 struct Proxy {
     address: SocketAddr,
     client: TcpStream,
@@ -42,34 +52,38 @@ struct Proxy {
 
 impl Proxy {
     async fn start() -> Self {
-        Self::start_with(None, None, Arc::default()).await
+        Self::start_with(Setup::default()).await
     }
 
     /// Starts a proxy with a switchable scanner, returning the driver the
     /// test plays the scanner with.
     async fn start_with_scanner(configured: ScanMode) -> (Self, ScannerDriver) {
         let (handle, driver) = scanner::channel(configured);
-        (
-            Self::start_with(Some(handle), None, Arc::default()).await,
-            driver,
-        )
+        let setup = Setup {
+            scanner: Some(handle),
+            ..Setup::default()
+        };
+        (Self::start_with(setup).await, driver)
     }
 
     /// Starts a proxy that offers connections, returning the driver the
     /// test plays the connection manager with.
     async fn start_with_connections(limit: u32) -> (Self, ConnectionsDriver) {
         let (handle, driver) = connections::channel(limit, AddressFilter::default());
-        (
-            Self::start_with(None, Some(handle), Arc::default()).await,
-            driver,
-        )
+        let setup = Setup {
+            connections: Some(handle),
+            ..Setup::default()
+        };
+        (Self::start_with(setup).await, driver)
     }
 
-    async fn start_with(
-        scanner: Option<ScannerHandle>,
-        connections: Option<ConnectionsHandle>,
-        logs: Arc<Logs>,
-    ) -> Self {
+    async fn start_with(setup: Setup) -> Self {
+        let Setup {
+            scanner,
+            connections,
+            logs,
+            diagnostics,
+        } = setup;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("local address");
         let mut identity = Identity::new(None, None, MAC, MAC).expect("identity");
@@ -85,7 +99,7 @@ impl Proxy {
             identity: Arc::new(identity),
             advertisements: advertisements.clone(),
             scanner,
-            diagnostics: Arc::default(),
+            diagnostics,
             encryption: None,
             connections,
             logs,
@@ -316,6 +330,85 @@ async fn forwards_advertisements_to_subscribers() {
     assert_eq!(entry[3].as_bytes(), Ok(&[0x02, 0x01, 0x06][..]));
 }
 
+#[tokio::test]
+async fn reports_allowed_devices_signal() {
+    const SCALE: BdAddr = BdAddr::new([0x5C, 0xCA, 0xD3, 0xBA, 0xBA, 0xCC]);
+    let diagnostics = Arc::new(Diagnostics::with_devices([(SCALE, "Scale".to_owned())]));
+    let mut proxy = Proxy::start_with(Setup {
+        diagnostics: Arc::clone(&diagnostics),
+        ..Setup::default()
+    })
+    .await;
+    tokio::spawn(Arc::clone(&diagnostics).count_advertisements(proxy.advertisements.subscribe()));
+    proxy.hello().await;
+
+    // The device's sensors follow the proxy's own.
+    proxy.send(11, &[]).await;
+    let mut listed = Vec::new();
+    loop {
+        let (message_type, payload) = proxy.receive().await;
+        if message_type == 19 {
+            break;
+        }
+        let listing = fields(&payload);
+        listed.push((message_type, string_field(&listing, 3).to_owned()));
+    }
+    let tail: Vec<(u16, &str)> = listed[listed.len() - 2..]
+        .iter()
+        .map(|(t, name)| (*t, name.as_str()))
+        .collect();
+    assert_eq!(tail, [(16, "Scale RSSI"), (18, "Scale Last Seen")]);
+
+    // Once heard, a new subscriber gets its signal and when it was heard.
+    proxy
+        .advertisements
+        .send(Advertisement {
+            address: SCALE,
+            address_type: AddressType::Public,
+            rssi: -67,
+            data: AdvData::default(),
+        })
+        .expect("a receiver");
+    timeout(DEADLINE, async {
+        while diagnostics.device_states()[0].rssi.missing_state {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the advertisement is counted");
+    proxy.send(20, &[]).await;
+    let mut rssi = None;
+    let mut last_seen = None;
+    while rssi.is_none() || last_seen.is_none() {
+        let (message_type, payload) = proxy.receive().await;
+        let state = fields(&payload);
+        let key = state
+            .iter()
+            .find(|field| field.number == 1)
+            .map(|field| field.value);
+        match (message_type, key) {
+            (25, Some(Value::Fixed32(16))) => {
+                rssi =
+                    state
+                        .iter()
+                        .find(|field| field.number == 2)
+                        .map(|field| match field.value {
+                            Value::Fixed32(bits) => f32::from_bits(bits),
+                            ref other => panic!("unexpected state {other:?}"),
+                        });
+            }
+            (27, Some(Value::Fixed32(17))) => last_seen = Some(string_field(&state, 2).to_owned()),
+            _ => {}
+        }
+    }
+    assert_eq!(rssi, Some(-67.0));
+    let last_seen = last_seen.expect("a time");
+    assert!(
+        last_seen.len() == 20 && last_seen.ends_with('Z'),
+        "{last_seen}"
+    );
+}
+
 /// The logs every test's events go to. A global subscriber is the only
 /// way to see the server's events, which it logs from its own tasks.
 fn logs() -> Arc<Logs> {
@@ -347,7 +440,11 @@ fn log_line(payload: &[u8]) -> (u32, String) {
 
 #[tokio::test]
 async fn streams_logs_to_subscribers() {
-    let mut proxy = Proxy::start_with(None, None, logs()).await;
+    let mut proxy = Proxy::start_with(Setup {
+        logs: logs(),
+        ..Setup::default()
+    })
+    .await;
     proxy.hello().await;
 
     // SubscribeLogsRequest { level: INFO, dump_config: true } first gets

@@ -65,15 +65,17 @@ struct Cli {
 
     /// Only forward advertisements from, and connect to, the device with
     /// this address. Repeat it (or separate addresses with commas) to
-    /// allow several devices. [default: every device]
+    /// allow several devices. Each allowed device gets signal strength and
+    /// last seen sensors, named after the label given with `=NAME`, or else
+    /// the address. [default: every device]
     #[cfg(target_os = "linux")]
     #[arg(
         long = "allow-address",
         env = "BLEPROXY_ALLOW_ADDRESS",
-        value_name = "ADDRESS",
+        value_name = "ADDRESS[=NAME]",
         value_delimiter = ','
     )]
-    allow_addresses: Vec<BdAddr>,
+    allow_addresses: Vec<bleproxy::filter::AllowedDevice>,
 
     /// Key that encrypts the API, as 32 bytes of base64 (ESPHome's
     /// `api: encryption: key:`). Generate one with
@@ -166,15 +168,18 @@ async fn run(mut cli: Cli, logs: Arc<Logs>) -> Result<(), Box<dyn Error>> {
         (None, None) => None,
     };
     let (advertisements, _) = broadcast::channel(1024);
-    let diagnostics = Arc::new(Diagnostics::new());
-    tokio::spawn(Arc::clone(&diagnostics).count_advertisements(advertisements.subscribe()));
+    // Count from the first advertisement on.
+    let counted = advertisements.subscribe();
 
     let Bluetooth {
         mac: bluetooth_mac,
         scanner,
         connections,
+        devices,
         config: platform_config,
     } = start_bluetooth(&cli, &advertisements).await?;
+    let diagnostics = Arc::new(Diagnostics::with_devices(devices));
+    tokio::spawn(Arc::clone(&diagnostics).count_advertisements(counted));
     let mac = cli.mac.unwrap_or(bluetooth_mac);
     let mut identity = Identity::new(cli.name, cli.friendly_name, mac, bluetooth_mac)?;
     if let Some(scanner) = &scanner {
@@ -247,6 +252,8 @@ struct Bluetooth {
     mac: BdAddr,
     scanner: Option<bleproxy::scanner::ScannerHandle>,
     connections: Option<bleproxy::connections::ConnectionsHandle>,
+    /// The devices to report the signal of, with their names.
+    devices: Vec<(BdAddr, String)>,
     /// Lines describing the Bluetooth configuration.
     config: Vec<String>,
 }
@@ -261,10 +268,26 @@ async fn start_bluetooth(
         .await
         .map_err(|err| format!("cannot use Bluetooth adapter {}: {err}", cli.adapter))?;
     info!(adapter = cli.adapter, %address, "using Bluetooth adapter");
-    let filter = bleproxy::filter::AddressFilter::new(cli.allow_addresses.clone());
+    let filter = bleproxy::filter::AddressFilter::new(
+        cli.allow_addresses
+            .iter()
+            .map(|device| device.address)
+            .collect::<Vec<_>>(),
+    );
     if filter.is_restricted() {
         info!(devices = %filter, "only forwarding allowed devices");
     }
+    let devices = cli
+        .allow_addresses
+        .iter()
+        .map(|device| {
+            let name = device
+                .label
+                .clone()
+                .unwrap_or_else(|| device.address.to_string());
+            (device.address, name)
+        })
+        .collect();
     let config = vec![
         format!("Bluetooth adapter: {} ({address})", cli.adapter),
         format!("Scan mode: {:?}", cli.scan_mode),
@@ -290,6 +313,7 @@ async fn start_bluetooth(
         mac: address,
         scanner: Some(handle),
         connections,
+        devices,
         config,
     })
 }
@@ -308,6 +332,7 @@ async fn start_bluetooth(
         mac: bleproxy::identity::derived_mac(cli.name.as_deref().unwrap_or("bleproxy")),
         scanner: None,
         connections: None,
+        devices: Vec::new(),
         config: Vec::new(),
     })
 }
@@ -359,24 +384,27 @@ mod tests {
         let cli = Cli::try_parse_from([
             "bleproxy",
             "--allow-address",
-            "5C:CA:D3:BA:BA:CC,A4:C1:38:00:11:22",
+            "5C:CA:D3:BA:BA:CC=Scale,A4:C1:38:00:11:22",
             "--allow-address",
             "A4:C1:38:00:33:44",
         ])
         .unwrap();
-        let addresses: Vec<String> = cli
+        let devices: Vec<(String, Option<&str>)> = cli
             .allow_addresses
             .iter()
-            .map(ToString::to_string)
+            .map(|device| (device.address.to_string(), device.label.as_deref()))
             .collect();
         assert_eq!(
-            addresses,
+            devices,
             [
-                "5C:CA:D3:BA:BA:CC",
-                "A4:C1:38:00:11:22",
-                "A4:C1:38:00:33:44"
+                ("5C:CA:D3:BA:BA:CC".to_owned(), Some("Scale")),
+                ("A4:C1:38:00:11:22".to_owned(), None),
+                ("A4:C1:38:00:33:44".to_owned(), None),
             ]
         );
         assert!(Cli::try_parse_from(["bleproxy", "--allow-address", "scale"]).is_err());
+        assert!(
+            Cli::try_parse_from(["bleproxy", "--allow-address", "5C:CA:D3:BA:BA:CC="]).is_err()
+        );
     }
 }

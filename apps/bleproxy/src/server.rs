@@ -484,8 +484,8 @@ impl<W: AsyncWriteExt + Unpin> Outbound<W> {
         self.send(reply.message_type(), len).await
     }
 
-    /// Describes the diagnostic sensors, and the scanning switch if there
-    /// is a scanner.
+    /// Describes the diagnostic sensors, including the allowed devices'
+    /// ones, and the scanning switch if there is a scanner.
     async fn entities(&mut self, context: &Context) -> Result<(), ConnectionError> {
         if context.scanner.is_some() {
             self.message(&SCANNING_SWITCH).await?;
@@ -495,6 +495,10 @@ impl<W: AsyncWriteExt + Unpin> Outbound<W> {
         }
         for listing in &diagnostics::SENSORS {
             self.message(listing).await?;
+        }
+        for (rssi, last_seen) in context.diagnostics.device_entities() {
+            self.message(&rssi).await?;
+            self.message(&last_seen).await?;
         }
         Ok(())
     }
@@ -511,6 +515,10 @@ impl<W: AsyncWriteExt + Unpin> Outbound<W> {
         }
         for state in context.diagnostics.sensor_states() {
             self.message(&state).await?;
+        }
+        for device in context.diagnostics.device_states() {
+            self.message(&device.rssi).await?;
+            self.message(&device.last_seen()).await?;
         }
         Ok(())
     }
