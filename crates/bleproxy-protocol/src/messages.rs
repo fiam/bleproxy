@@ -36,10 +36,18 @@ pub mod message_type {
     pub const DEVICE_INFO_RESPONSE: u16 = 10;
     /// [`ClientMessage::ListEntities`](super::ClientMessage::ListEntities).
     pub const LIST_ENTITIES_REQUEST: u16 = 11;
+    /// [`ListEntitiesSensorResponse`](super::ListEntitiesSensorResponse).
+    pub const LIST_ENTITIES_SENSOR_RESPONSE: u16 = 16;
+    /// [`ListEntitiesTextSensorResponse`](super::ListEntitiesTextSensorResponse).
+    pub const LIST_ENTITIES_TEXT_SENSOR_RESPONSE: u16 = 18;
     /// [`ListEntitiesDoneResponse`](super::ListEntitiesDoneResponse).
     pub const LIST_ENTITIES_DONE_RESPONSE: u16 = 19;
     /// [`ClientMessage::SubscribeStates`](super::ClientMessage::SubscribeStates).
     pub const SUBSCRIBE_STATES_REQUEST: u16 = 20;
+    /// [`SensorStateResponse`](super::SensorStateResponse).
+    pub const SENSOR_STATE_RESPONSE: u16 = 25;
+    /// [`TextSensorStateResponse`](super::TextSensorStateResponse).
+    pub const TEXT_SENSOR_STATE_RESPONSE: u16 = 27;
     /// [`ClientMessage::SubscribeLogs`](super::ClientMessage::SubscribeLogs).
     pub const SUBSCRIBE_LOGS_REQUEST: u16 = 28;
     /// [`ClientMessage::SubscribeHomeassistantServices`](super::ClientMessage::SubscribeHomeassistantServices).
@@ -110,6 +118,30 @@ pub mod bluetooth_proxy_feature {
     /// [`BluetoothScannerStateResponse`](super::BluetoothScannerStateResponse))
     /// and accepts scan mode changes.
     pub const STATE_AND_MODE: u32 = 1 << 6;
+}
+
+/// Values of the `EntityCategory` enum, which tells clients where to show
+/// an entity.
+pub mod entity_category {
+    /// A regular entity.
+    pub const NONE: u32 = 0;
+    /// A setting.
+    pub const CONFIG: u32 = 1;
+    /// Information about the device itself, rather than what it controls.
+    pub const DIAGNOSTIC: u32 = 2;
+}
+
+/// Values of the `SensorStateClass` enum, which tells clients how to keep
+/// statistics for a sensor.
+pub mod sensor_state_class {
+    /// No statistics.
+    pub const NONE: u32 = 0;
+    /// A current value, such as a temperature.
+    pub const MEASUREMENT: u32 = 1;
+    /// A counter that only grows, except for resets.
+    pub const TOTAL_INCREASING: u32 = 2;
+    /// A total that may grow and shrink.
+    pub const TOTAL: u32 = 3;
 }
 
 /// Values of the `BluetoothScannerMode` enum.
@@ -579,6 +611,116 @@ impl Encode for DeviceInfoResponse<'_> {
 
 impl Message for DeviceInfoResponse<'_> {
     const TYPE: u16 = message_type::DEVICE_INFO_RESPONSE;
+}
+
+/// Describes a numeric sensor, in answer to
+/// [`ClientMessage::ListEntities`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ListEntitiesSensorResponse<'a> {
+    /// Identifier, unique among the device's sensors. Clients derive the
+    /// entity's identity from it.
+    pub object_id: &'a str,
+    /// Key that state updates refer to.
+    pub key: u32,
+    /// Display name.
+    pub name: &'a str,
+    /// Icon, such as `mdi:counter`.
+    pub icon: &'a str,
+    /// Unit of the values.
+    pub unit_of_measurement: &'a str,
+    /// Decimal places to show.
+    pub accuracy_decimals: i32,
+    /// One of the [`sensor_state_class`] values.
+    pub state_class: u32,
+    /// One of the [`entity_category`] values.
+    pub entity_category: u32,
+}
+
+impl Encode for ListEntitiesSensorResponse<'_> {
+    fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+        e.string(1, self.object_id)?;
+        e.fixed32(2, self.key)?;
+        e.string(3, self.name)?;
+        e.string(5, self.icon)?;
+        e.string(6, self.unit_of_measurement)?;
+        e.int32(7, self.accuracy_decimals)?;
+        e.uint32(10, self.state_class)?;
+        e.uint32(13, self.entity_category)
+    }
+}
+
+impl Message for ListEntitiesSensorResponse<'_> {
+    const TYPE: u16 = message_type::LIST_ENTITIES_SENSOR_RESPONSE;
+}
+
+/// Describes a text sensor, in answer to [`ClientMessage::ListEntities`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ListEntitiesTextSensorResponse<'a> {
+    /// Identifier, unique among the device's text sensors. Clients derive
+    /// the entity's identity from it.
+    pub object_id: &'a str,
+    /// Key that state updates refer to.
+    pub key: u32,
+    /// Display name.
+    pub name: &'a str,
+    /// Icon, such as `mdi:clock-outline`.
+    pub icon: &'a str,
+    /// One of the [`entity_category`] values.
+    pub entity_category: u32,
+}
+
+impl Encode for ListEntitiesTextSensorResponse<'_> {
+    fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+        e.string(1, self.object_id)?;
+        e.fixed32(2, self.key)?;
+        e.string(3, self.name)?;
+        e.string(5, self.icon)?;
+        e.uint32(7, self.entity_category)
+    }
+}
+
+impl Message for ListEntitiesTextSensorResponse<'_> {
+    const TYPE: u16 = message_type::LIST_ENTITIES_TEXT_SENSOR_RESPONSE;
+}
+
+/// A numeric sensor's state, sent once the client subscribed to states.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SensorStateResponse {
+    /// The sensor's [`ListEntitiesSensorResponse::key`].
+    pub key: u32,
+    /// Its value.
+    pub state: f32,
+}
+
+impl Encode for SensorStateResponse {
+    fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+        e.fixed32(1, self.key)?;
+        e.float(2, self.state)
+    }
+}
+
+impl Message for SensorStateResponse {
+    const TYPE: u16 = message_type::SENSOR_STATE_RESPONSE;
+}
+
+/// A text sensor's state, sent once the client subscribed to states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TextSensorStateResponse<'a> {
+    /// The sensor's [`ListEntitiesTextSensorResponse::key`].
+    pub key: u32,
+    /// Its value.
+    pub state: &'a str,
+}
+
+impl Encode for TextSensorStateResponse<'_> {
+    fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+        e.fixed32(1, self.key)?;
+        e.string(2, self.state)
+    }
+}
+
+impl Message for TextSensorStateResponse<'_> {
+    const TYPE: u16 = message_type::TEXT_SENSOR_STATE_RESPONSE;
 }
 
 /// Declares a message without fields.
@@ -1090,6 +1232,71 @@ mod tests {
             ClientMessage::decode(66, &[]),
             Ok(ClientMessage::SubscribeBluetoothLeAdvertisements { flags: 0 })
         );
+    }
+
+    #[test]
+    fn encodes_entity_listings() {
+        let advertisements = ListEntitiesSensorResponse {
+            object_id: "advertisements",
+            key: 2,
+            name: "Advertisements",
+            icon: "mdi:bluetooth-searching",
+            unit_of_measurement: "adv",
+            accuracy_decimals: 0,
+            state_class: sensor_state_class::TOTAL_INCREASING,
+            entity_category: entity_category::DIAGNOSTIC,
+        };
+        assert_encodes(
+            &advertisements,
+            "0a0e6164766572746973656d656e747315020000001a0e4164766572746973656d656e74732a176d64693a\
+             626c7565746f6f74682d736561726368696e67320361647650026802",
+        );
+        let clients = ListEntitiesSensorResponse {
+            object_id: "connected_clients",
+            key: 3,
+            name: "Connected Clients",
+            icon: "mdi:account-network",
+            state_class: sensor_state_class::MEASUREMENT,
+            entity_category: entity_category::DIAGNOSTIC,
+            ..ListEntitiesSensorResponse::default()
+        };
+        assert_encodes(
+            &clients,
+            "0a11636f6e6e65637465645f636c69656e747315030000001a11436f6e6e656374656420436c69656e7473\
+             2a136d64693a6163636f756e742d6e6574776f726b50016802",
+        );
+        let uptime = ListEntitiesTextSensorResponse {
+            object_id: "uptime",
+            key: 1,
+            name: "Uptime",
+            icon: "mdi:clock-outline",
+            entity_category: entity_category::DIAGNOSTIC,
+        };
+        assert_encodes(
+            &uptime,
+            "0a06757074696d6515010000001a06557074696d652a116d64693a636c6f636b2d6f75746c696e653802",
+        );
+        assert_eq!(ListEntitiesSensorResponse::TYPE, 16);
+        assert_eq!(ListEntitiesTextSensorResponse::TYPE, 18);
+    }
+
+    #[test]
+    fn encodes_entity_states() {
+        let count = SensorStateResponse {
+            key: 2,
+            state: 1234.0,
+        };
+        assert_encodes(&count, "0d020000001500409a44");
+        // Zero is the default, so only the key is sent.
+        let none = SensorStateResponse { key: 3, state: 0.0 };
+        assert_encodes(&none, "0d03000000");
+        let uptime = TextSensorStateResponse {
+            key: 1,
+            state: "1d 2h 3m 45s",
+        };
+        assert_encodes(&uptime, "0d01000000120c316420326820336d20343573");
+        assert_eq!(SensorStateResponse::TYPE, 25);
+        assert_eq!(TextSensorStateResponse::TYPE, 27);
     }
 
     #[test]

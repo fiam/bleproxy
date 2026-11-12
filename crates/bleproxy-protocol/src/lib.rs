@@ -27,7 +27,9 @@ pub use messages::{
     BluetoothGattReadResponse, BluetoothGattService, BluetoothGattWriteResponse,
     BluetoothLeRawAdvertisementsResponse, BluetoothScannerStateResponse, ClientMessage,
     DeviceInfoResponse, DisconnectRequest, DisconnectResponse, HelloRequest, HelloResponse,
-    ListEntitiesDoneResponse, Message, PingRequest, PingResponse, RawAdvertisement,
+    ListEntitiesDoneResponse, ListEntitiesSensorResponse, ListEntitiesTextSensorResponse, Message,
+    PingRequest, PingResponse, RawAdvertisement, SensorStateResponse, TextSensorStateResponse,
     bluetooth_device_request_type, bluetooth_error, bluetooth_proxy_feature,
-    bluetooth_proxy_subscription, bluetooth_scanner_mode, bluetooth_scanner_state, message_type,
+    bluetooth_proxy_subscription, bluetooth_scanner_mode, bluetooth_scanner_state, entity_category,
+    message_type, sensor_state_class,
 };

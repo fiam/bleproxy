@@ -215,6 +215,15 @@ impl<S: Sink> Encoder<S> {
         self.sink.put(&value.to_le_bytes())
     }
 
+    /// Writes a `float` field.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sink is full.
+    pub fn float(&mut self, field: u32, value: f32) -> Result<(), EncodeError> {
+        self.fixed32(field, value.to_bits())
+    }
+
     /// Writes a `string` field.
     ///
     /// # Errors
