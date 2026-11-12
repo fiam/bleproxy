@@ -2,9 +2,10 @@
 //! Assistant discovers it without configuration.
 
 use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use mdns_sd::{ServiceDaemon, ServiceInfo};
+use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 use tracing::warn;
 
 use bleproxy_protocol::noise::NOISE_PROTOCOL;
@@ -32,17 +33,24 @@ impl fmt::Debug for Announcement {
 }
 
 impl Announcement {
-    /// Starts announcing the API on `port` on every interface.
+    /// Starts announcing the API, listening on `listen`, on every
+    /// interface.
     ///
     /// The host name is the device name, which clients check against the
     /// name in the API hello. Addresses follow the host's interfaces as
-    /// they change.
+    /// they change. IPv6 addresses are only announced if the API listens
+    /// on IPv6: clients may pick any announced address, and Home Assistant
+    /// keeps using the one it picked.
     ///
     /// # Errors
     ///
     /// Returns an error if the mDNS responder cannot start.
-    pub fn start(identity: &Identity, port: u16) -> Result<Self, mdns_sd::Error> {
+    pub fn start(identity: &Identity, listen: SocketAddr) -> Result<Self, mdns_sd::Error> {
         let daemon = ServiceDaemon::new()?;
+        if !announces_ipv6(listen.ip()) {
+            daemon.disable_interface(vec![IfKind::IPv6, IfKind::LoopbackV6])?;
+        }
+        let port = listen.port();
         let host = format!("{}.local.", identity.name());
         let info = ServiceInfo::new(
             SERVICE_TYPE,
@@ -73,6 +81,13 @@ impl Announcement {
     }
 }
 
+/// Returns whether clients can reach an API listening on `listen` over
+/// IPv6. An IPv6 socket, `[::]` included, accepts IPv6 clients (and on most
+/// hosts IPv4 ones too); an IPv4 socket only IPv4 clients.
+const fn announces_ipv6(listen: IpAddr) -> bool {
+    listen.is_ipv6()
+}
+
 /// TXT records in the form ESPHome publishes them. Home Assistant uses
 /// `mac` to recognize the device, `friendly_name` as its title, and asks
 /// for the encryption key when `api_encryption` is present.
@@ -97,6 +112,15 @@ mod tests {
     use bleproxy_core::BdAddr;
 
     use super::*;
+
+    #[test]
+    fn announces_ipv6_only_when_listening_on_it() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        assert!(!announces_ipv6(ip("0.0.0.0")));
+        assert!(!announces_ipv6(ip("192.168.1.227")));
+        assert!(announces_ipv6(ip("::")));
+        assert!(announces_ipv6(ip("2001:db8::1")));
+    }
 
     #[test]
     fn publishes_esphome_txt_records() {

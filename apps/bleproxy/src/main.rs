@@ -95,7 +95,8 @@ struct Cli {
     #[arg(long, env = "BLEPROXY_ENCRYPTION_KEY_FILE")]
     encryption_key_file: Option<PathBuf>,
 
-    /// Address and port for the ESPHome API.
+    /// Address and port for the ESPHome API. `[::]:6053` also accepts IPv6
+    /// clients, and announces the host's IPv6 addresses over mDNS.
     #[arg(long, env = "BLEPROXY_LISTEN", default_value = "0.0.0.0:6053")]
     listen: SocketAddr,
 
@@ -207,7 +208,7 @@ async fn run(mut cli: Cli, logs: Arc<Logs>) -> Result<(), Box<dyn Error>> {
     let announcement = if cli.no_mdns {
         None
     } else {
-        let announcement = Announcement::start(&identity, address.port())?;
+        let announcement = Announcement::start(&identity, address)?;
         info!(host = %format_args!("{}.local", identity.name()), "announced over mDNS");
         Some(announcement)
     };

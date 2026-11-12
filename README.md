@@ -175,7 +175,7 @@ Every option is a command-line flag and a `BLEPROXY_*` environment variable:
 | `--encryption-key` | `BLEPROXY_ENCRYPTION_KEY` | none | Base64 key that encrypts the API (see below) |
 | `--encryption-key-file` | `BLEPROXY_ENCRYPTION_KEY_FILE` | none | File holding that key, to keep it out of the environment |
 | `--mac` | `BLEPROXY_MAC` | the adapter's address | Address identifying the proxy in Home Assistant |
-| `--listen` | `BLEPROXY_LISTEN` | `0.0.0.0:6053` | Address and port of the ESPHome API |
+| `--listen` | `BLEPROXY_LISTEN` | `0.0.0.0:6053` | Address and port of the ESPHome API; `[::]:6053` also accepts IPv6 clients and announces the host's IPv6 addresses |
 | `--no-mdns` | `BLEPROXY_NO_MDNS` | off | Don't announce the proxy over mDNS |
 | `--log-level` | `BLEPROXY_LOG` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
 
