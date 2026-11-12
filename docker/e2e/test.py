@@ -20,7 +20,16 @@ from aioesphomeapi.core import (
     InvalidEncryptionKeyAPIError,
     RequiresEncryptionAPIError,
 )
-from aioesphomeapi.model import BluetoothScannerMode, BluetoothScannerState
+from aioesphomeapi.model import (
+    BluetoothScannerMode,
+    BluetoothScannerState,
+    EntityCategory,
+    SensorInfo,
+    SensorState,
+    SensorStateClass,
+    TextSensorInfo,
+    TextSensorState,
+)
 
 PORT = 6053
 ADAPTER_ADDRESS = "00:01:02:03:04:05"  # what the mock assigns to hci0
@@ -298,6 +307,31 @@ async def check_scanning_started(bus, mode, pid):
         assert (0, 0x01, b"\x06") in patterns, patterns
 
 
+async def check_diagnostics(client):
+    """The proxy's own sensors, listed and reported like ESPHome entities."""
+    step("checking the diagnostic sensors")
+    entities, services = await client.list_entities_services()
+    assert not services, services
+    by_id = {entity.object_id: entity for entity in entities}
+    assert set(by_id) == {"uptime", "advertisements", "connected_clients"}, by_id
+    assert isinstance(by_id["uptime"], TextSensorInfo), by_id
+    assert isinstance(by_id["advertisements"], SensorInfo), by_id
+    assert by_id["advertisements"].state_class == SensorStateClass.TOTAL_INCREASING, by_id
+    assert by_id["connected_clients"].state_class == SensorStateClass.MEASUREMENT, by_id
+    assert all(e.entity_category == EntityCategory.DIAGNOSTIC for e in entities), entities
+
+    states = []
+    client.subscribe_states(states.append)
+    async with asyncio.timeout(TIMEOUT):
+        while len(states) < len(entities):
+            await asyncio.sleep(0.05)
+    by_key = {state.key: state for state in states}
+    uptime = by_key[by_id["uptime"].key]
+    assert isinstance(uptime, TextSensorState) and uptime.state.endswith("s"), uptime
+    clients = by_key[by_id["connected_clients"].key]
+    assert isinstance(clients, SensorState) and clients.state == 1, clients
+
+
 def start_proxy(binary, mode, env):
     step("starting bleproxy")
     # Unprivileged, as in deployments: the bus policy must let it in.
@@ -398,6 +432,7 @@ async def main(binary, mode, encrypted, filtered):
         # Passive scan, active connections, remote caching, raw
         # advertisements, and state and mode.
         assert flags == 0b110_0111, flags
+        await check_diagnostics(client)
 
         states = []
         client.subscribe_bluetooth_scanner_state(states.append)
