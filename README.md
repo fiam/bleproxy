@@ -126,6 +126,14 @@ since starting, and how many clients (hosts) are connected to it. A **BLE
 Scanning** switch pauses scanning until it is turned back on; it starts on
 whenever bleproxy starts.
 
+To see the proxy's logs in Home Assistant's, turn on **Subscribe to logs
+from the device** in the ESPHome entry's options (**Configure**). Like an
+ESPHome device, bleproxy then streams its log lines, starting with its
+configuration, at the level of Home Assistant's
+`homeassistant.components.esphome` logger (warnings by default; raise it to
+`info` or `debug` with the `logger` integration). The level is independent of
+`BLEPROXY_LOG`, which only controls what bleproxy prints itself.
+
 ### Configuration
 
 Every option is a command-line flag and a `BLEPROXY_*` environment variable:
@@ -347,7 +355,8 @@ in both scan modes:
 - aioesphomeapi, the client library Home Assistant uses, checks the device
   info and diagnostic sensors, that new and updated devices arrive as the
   expected raw advertisements, the reported scanner state, switching modes
-  at runtime, and pausing scanning with the BLE Scanning switch.
+  at runtime, pausing scanning with the BLE Scanning switch, and streaming
+  logs.
 - The mock exports a GATT database like bluetoothd, and the client connects
   through bleproxy, lists services, reads, writes, subscribes to
   notifications and disconnects, checking BlueZ's quirks along the way.
@@ -436,6 +445,7 @@ Releases are fully automated with [release-please]:
 - [x] Active connections (GATT proxying) on Linux
 - [x] Diagnostic sensors: uptime, forwarded advertisements, connected clients
 - [x] BLE Scanning switch
+- [x] Logs streamed to Home Assistant
 - [ ] Windows and macOS backends
 - [ ] BLE scanning on ESP32 via esp-radio and TrouBLE
 
