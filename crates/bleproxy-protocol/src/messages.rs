@@ -54,6 +54,8 @@ pub mod message_type {
     pub const TEXT_SENSOR_STATE_RESPONSE: u16 = 27;
     /// [`ClientMessage::SubscribeLogs`](super::ClientMessage::SubscribeLogs).
     pub const SUBSCRIBE_LOGS_REQUEST: u16 = 28;
+    /// [`SubscribeLogsResponse`](super::SubscribeLogsResponse).
+    pub const SUBSCRIBE_LOGS_RESPONSE: u16 = 29;
     /// [`ClientMessage::SwitchCommand`](super::ClientMessage::SwitchCommand).
     pub const SWITCH_COMMAND_REQUEST: u16 = 33;
     /// [`ClientMessage::SubscribeHomeassistantServices`](super::ClientMessage::SubscribeHomeassistantServices).
@@ -148,6 +150,26 @@ pub mod sensor_state_class {
     pub const TOTAL_INCREASING: u32 = 2;
     /// A total that may grow and shrink.
     pub const TOTAL: u32 = 3;
+}
+
+/// Values of the `LogLevel` enum. Each level includes the ones before it.
+pub mod log_level {
+    /// No logs.
+    pub const NONE: u32 = 0;
+    /// Errors.
+    pub const ERROR: u32 = 1;
+    /// Warnings.
+    pub const WARN: u32 = 2;
+    /// Notable events.
+    pub const INFO: u32 = 3;
+    /// The device's configuration, logged on request.
+    pub const CONFIG: u32 = 4;
+    /// Details for debugging.
+    pub const DEBUG: u32 = 5;
+    /// More details.
+    pub const VERBOSE: u32 = 6;
+    /// Everything.
+    pub const VERY_VERBOSE: u32 = 7;
 }
 
 /// Values of the `BluetoothScannerMode` enum.
@@ -256,8 +278,14 @@ pub enum ClientMessage<'a> {
     ListEntities,
     /// Subscribes to entity state updates.
     SubscribeStates,
-    /// Subscribes to device logs.
-    SubscribeLogs,
+    /// Subscribes to device logs, answered with [`SubscribeLogsResponse`]
+    /// messages. A later subscription replaces the level.
+    SubscribeLogs {
+        /// The most detailed [`log_level`] to send.
+        level: u32,
+        /// Whether to log the device's configuration now.
+        dump_config: bool,
+    },
     /// Subscribes to Home Assistant service calls made by the device.
     SubscribeHomeassistantServices,
     /// Subscribes to Home Assistant states the device wants to follow.
@@ -390,7 +418,18 @@ impl<'a> ClientMessage<'a> {
             t::DEVICE_INFO_REQUEST => Self::DeviceInfo,
             t::LIST_ENTITIES_REQUEST => Self::ListEntities,
             t::SUBSCRIBE_STATES_REQUEST => Self::SubscribeStates,
-            t::SUBSCRIBE_LOGS_REQUEST => Self::SubscribeLogs,
+            t::SUBSCRIBE_LOGS_REQUEST => {
+                let (mut level, mut dump_config) = (log_level::NONE, false);
+                for field in Fields::new(payload) {
+                    let field = field?;
+                    match field.number {
+                        1 => level = field.as_u32()?,
+                        2 => dump_config = field.as_bool()?,
+                        _ => {}
+                    }
+                }
+                Self::SubscribeLogs { level, dump_config }
+            }
             t::SUBSCRIBE_HOMEASSISTANT_SERVICES_REQUEST => Self::SubscribeHomeassistantServices,
             t::SUBSCRIBE_HOME_ASSISTANT_STATES_REQUEST => Self::SubscribeHomeAssistantStates,
             t::SUBSCRIBE_BLUETOOTH_LE_ADVERTISEMENTS_REQUEST => {
@@ -797,6 +836,28 @@ impl Encode for TextSensorStateResponse<'_> {
 
 impl Message for TextSensorStateResponse<'_> {
     const TYPE: u16 = message_type::TEXT_SENSOR_STATE_RESPONSE;
+}
+
+/// A log line, sent to clients that subscribed with
+/// [`ClientMessage::SubscribeLogs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SubscribeLogsResponse<'a> {
+    /// The line's [`log_level`].
+    pub level: u32,
+    /// The line, as ESPHome formats it (`[I][tag]: message`). Clients
+    /// decode it as UTF-8.
+    pub message: &'a [u8],
+}
+
+impl Encode for SubscribeLogsResponse<'_> {
+    fn encode<S: Sink>(&self, e: &mut Encoder<S>) -> Result<(), EncodeError> {
+        e.uint32(1, self.level)?;
+        e.bytes(3, self.message)
+    }
+}
+
+impl Message for SubscribeLogsResponse<'_> {
+    const TYPE: u16 = message_type::SUBSCRIBE_LOGS_RESPONSE;
 }
 
 /// Declares a message without fields.
@@ -1424,6 +1485,34 @@ mod tests {
     }
 
     #[test]
+    fn decodes_log_subscriptions() {
+        let cases = [
+            ("08051001", log_level::DEBUG, true),
+            ("0803", log_level::INFO, false),
+        ];
+        for (payload, level, dump_config) in cases {
+            let (payload, len) = hex(payload);
+            assert_eq!(
+                ClientMessage::decode(28, &payload[..len]),
+                Ok(ClientMessage::SubscribeLogs { level, dump_config })
+            );
+        }
+    }
+
+    #[test]
+    fn encodes_log_lines() {
+        let line = SubscribeLogsResponse {
+            level: log_level::INFO,
+            message: b"[I][bleproxy]: client connected",
+        };
+        assert_encodes(
+            &line,
+            "08031a1f5b495d5b626c6570726f78795d3a20636c69656e7420636f6e6e6563746564",
+        );
+        assert_eq!(SubscribeLogsResponse::TYPE, 29);
+    }
+
+    #[test]
     fn encodes_scanner_state() {
         let running = BluetoothScannerStateResponse {
             state: bluetooth_scanner_state::RUNNING,
@@ -1465,7 +1554,13 @@ mod tests {
             (9, ClientMessage::DeviceInfo),
             (11, ClientMessage::ListEntities),
             (20, ClientMessage::SubscribeStates),
-            (28, ClientMessage::SubscribeLogs),
+            (
+                28,
+                ClientMessage::SubscribeLogs {
+                    level: log_level::NONE,
+                    dump_config: false,
+                },
+            ),
             (34, ClientMessage::SubscribeHomeassistantServices),
             (38, ClientMessage::SubscribeHomeAssistantStates),
             (80, ClientMessage::SubscribeBluetoothConnectionsFree),

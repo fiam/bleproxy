@@ -29,8 +29,8 @@ pub use messages::{
     DeviceInfoResponse, DisconnectRequest, DisconnectResponse, HelloRequest, HelloResponse,
     ListEntitiesDoneResponse, ListEntitiesSensorResponse, ListEntitiesSwitchResponse,
     ListEntitiesTextSensorResponse, Message, PingRequest, PingResponse, RawAdvertisement,
-    SensorStateResponse, SwitchStateResponse, TextSensorStateResponse,
+    SensorStateResponse, SubscribeLogsResponse, SwitchStateResponse, TextSensorStateResponse,
     bluetooth_device_request_type, bluetooth_error, bluetooth_proxy_feature,
     bluetooth_proxy_subscription, bluetooth_scanner_mode, bluetooth_scanner_state, entity_category,
-    message_type, sensor_state_class,
+    log_level, message_type, sensor_state_class,
 };

@@ -594,7 +594,13 @@ mod tests {
                 })),
             ),
             (ClientMessage::Authentication, None),
-            (ClientMessage::SubscribeLogs, None),
+            (
+                ClientMessage::SubscribeLogs {
+                    level: 3,
+                    dump_config: false,
+                },
+                None,
+            ),
             (ClientMessage::SubscribeHomeassistantServices, None),
             (ClientMessage::SubscribeHomeAssistantStates, None),
             (ClientMessage::PingResponse, None),
