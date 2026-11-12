@@ -140,7 +140,8 @@ pub async fn handle_connection(
     let _connected = stream
         .peer_addr()
         .ok()
-        .map(|peer| context.diagnostics.connect(peer.ip()));
+        // An IPv4 client of an IPv6 socket is the same host as over IPv4.
+        .map(|peer| context.diagnostics.connect(peer.ip().to_canonical()));
     let (mut reader, writer) = stream.into_split();
     let identity = &context.identity;
     let transport = context
