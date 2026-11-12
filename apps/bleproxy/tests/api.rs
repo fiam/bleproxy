@@ -172,6 +172,48 @@ async fn handshake_and_device_info() {
 }
 
 #[tokio::test]
+async fn switches_scanning_off_and_on() {
+    let (mut proxy, mut driver) = Proxy::start_with_scanner(ScanMode::Active).await;
+    proxy.hello().await;
+
+    // With a scanner, the BLE Scanning switch comes first.
+    proxy.send(11, &[]).await;
+    let (message_type, payload) = proxy.receive().await;
+    assert_eq!(message_type, 17, "ListEntitiesSwitchResponse");
+    assert_eq!(string_field(&fields(&payload), 1), "ble_scanning");
+    while proxy.receive().await.0 != 19 {}
+
+    // It starts on.
+    proxy.send(20, &[]).await;
+    let (message_type, payload) = proxy.receive().await;
+    assert_eq!(message_type, 26, "SwitchStateResponse");
+    assert_eq!(payload, hex("0d040000001001"));
+    let on = driver.wanted();
+    assert!(on.enabled);
+
+    // SwitchCommandRequest { key: 4, state: false } turns the scanner off,
+    // and the new state is pushed.
+    proxy.send(33, &[0x0D, 0x04, 0x00, 0x00, 0x00]).await;
+    let off = timeout(DEADLINE, driver.change(on)).await.expect("switch");
+    assert!(!off.enabled);
+    loop {
+        let (message_type, payload) = proxy.receive().await;
+        if message_type == 26 {
+            assert_eq!(payload, hex("0d04000000"), "off");
+            break;
+        }
+    }
+
+    // Commands for other keys are ignored.
+    proxy
+        .send(33, &[0x0D, 0x09, 0x00, 0x00, 0x00, 0x10, 0x01])
+        .await;
+    proxy.send(7, &[]).await;
+    while proxy.receive().await.0 != 8 {}
+    assert!(!driver.wanted().enabled);
+}
+
+#[tokio::test]
 async fn reports_diagnostic_sensors() {
     let mut proxy = Proxy::start().await;
     proxy.hello().await;
@@ -296,10 +338,11 @@ async fn reports_scanner_state_and_switches_modes() {
 
     // BluetoothScannerSetModeRequest { mode: PASSIVE } reaches the scanner.
     proxy.send(127, &[]).await;
-    let requested = timeout(DEADLINE, driver.mode_change(ScanMode::Active))
+    let initial = driver.wanted();
+    let requested = timeout(DEADLINE, driver.change(initial))
         .await
         .expect("mode request");
-    assert_eq!(requested, ScanMode::Passive);
+    assert_eq!(requested.mode, ScanMode::Passive);
 
     // Status changes are pushed to the subscriber.
     driver.report(ScannerState::Running, ScanMode::Passive);

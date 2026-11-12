@@ -29,7 +29,7 @@ use crate::Identity;
 use crate::connections::{Client, ConnectionsHandle, Event, Service, Slots};
 use crate::diagnostics::{self, Diagnostics, STATE_INTERVAL};
 use crate::encryption::EncryptionKey;
-use crate::scanner::ScannerHandle;
+use crate::scanner::{SCANNING_SWITCH, ScannerHandle};
 use crate::transport::{Message, Transport, TransportError};
 
 /// Most advertisements sent in one message, as ESPHome does.
@@ -147,6 +147,7 @@ pub async fn handle_connection(
     let device = identity.device_identity();
     let mut session = Session::new(&device);
     let mut scanner_status = context.scanner.as_ref().map(ScannerHandle::status);
+    let mut scanning = context.scanner.as_ref().map(ScannerHandle::wanted);
     let mut connections = context.connections.as_ref().map(ConnectionsHandle::client);
     let mut slots = None;
 
@@ -208,7 +209,10 @@ pub async fn handle_connection(
             _ = flush.tick(), if !batch.is_empty() => {
                 out.advertisements(&mut batch).await?;
             }
-            _ = refresh.tick(), if session.wants_states() => out.states(&context.diagnostics).await?,
+            _ = refresh.tick(), if session.wants_states() => out.states(context).await?,
+            Some(wanted) = changed(&mut scanning), if session.wants_states() => {
+                out.message(&wanted.switch_state()).await?;
+            }
             () = &mut idle => match keepalive.expired() {
                 Idle::Ping => {
                     debug!("pinging quiet client");
@@ -275,14 +279,14 @@ async fn handle_messages<W: AsyncWriteExt + Unpin + Send>(
         let subscribed = session.wants_states();
         let outcome = session.handle(&message);
         if outcome.list_entities {
-            out.entities().await?;
+            out.entities(context).await?;
         }
         if let Some(reply) = outcome.reply {
             out.reply(&reply).await?;
         }
         // Like ESPHome, send the current states to new subscribers.
         if !subscribed && session.wants_states() {
-            out.states(&context.diagnostics).await?;
+            out.states(context).await?;
         }
         forward(&outcome, context, client);
         if outcome.close {
@@ -348,12 +352,20 @@ impl Keepalive {
     }
 }
 
-/// Passes the scan mode and connection requests in `outcome` on to the
-/// scanner and the connection manager.
+/// Passes the scan mode, switch and connection requests in `outcome` on
+/// to the scanner and the connection manager.
 fn forward(outcome: &Outcome<'_, '_>, context: &Context, client: Option<&Client>) {
     if let (Some(mode), Some(scanner)) = (outcome.scan_mode, &context.scanner) {
         info!(?mode, "client requested a scan mode");
         scanner.request(mode);
+    }
+    match (outcome.switch, &context.scanner) {
+        (Some(command), Some(scanner)) if command.key == SCANNING_SWITCH.key => {
+            info!(on = command.state, "client switched scanning");
+            scanner.enable(command.state);
+        }
+        (Some(command), _) => debug!(key = command.key, "command for an unknown switch"),
+        (None, _) => {}
     }
     if let (Some(request), Some(client)) = (outcome.connection, client) {
         log_request(&request);
@@ -428,8 +440,12 @@ impl<W: AsyncWriteExt + Unpin> Outbound<W> {
         self.send(reply.message_type(), len).await
     }
 
-    /// Describes the diagnostic sensors.
-    async fn entities(&mut self) -> Result<(), ConnectionError> {
+    /// Describes the diagnostic sensors, and the scanning switch if there
+    /// is a scanner.
+    async fn entities(&mut self, context: &Context) -> Result<(), ConnectionError> {
+        if context.scanner.is_some() {
+            self.message(&SCANNING_SWITCH).await?;
+        }
         for listing in &diagnostics::TEXT_SENSORS {
             self.message(listing).await?;
         }
@@ -439,13 +455,17 @@ impl<W: AsyncWriteExt + Unpin> Outbound<W> {
         Ok(())
     }
 
-    /// Sends the diagnostic sensors' states.
-    async fn states(&mut self, diagnostics: &Diagnostics) -> Result<(), ConnectionError> {
-        let uptime = diagnostics.uptime();
+    /// Sends the states of the entities [`Self::entities`] describes.
+    async fn states(&mut self, context: &Context) -> Result<(), ConnectionError> {
+        if let Some(scanner) = &context.scanner {
+            let wanted = *scanner.wanted().borrow();
+            self.message(&wanted.switch_state()).await?;
+        }
+        let uptime = context.diagnostics.uptime();
         for state in Diagnostics::text_states(&uptime) {
             self.message(&state).await?;
         }
-        for state in diagnostics.sensor_states() {
+        for state in context.diagnostics.sensor_states() {
             self.message(&state).await?;
         }
         Ok(())

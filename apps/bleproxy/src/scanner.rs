@@ -1,30 +1,66 @@
 //! The link between API connections and the platform's scanner.
 //!
-//! Clients request scan modes and watch the scanner's status through a
+//! Clients request scan modes, turn scanning on and off with the
+//! [`SCANNING_SWITCH`], and watch the scanner's status through a
 //! [`ScannerHandle`]; the scanner task applies the requests and publishes
 //! its status through a [`ScannerDriver`].
 
 use std::sync::Arc;
 
 use bleproxy_core::scanner::{ScanMode, ScannerState, ScannerStatus};
+use bleproxy_protocol::{ListEntitiesSwitchResponse, SwitchStateResponse, entity_category};
 use tokio::sync::watch;
 
+/// The BLE Scanning switch, as listed to clients. Turning it off stops
+/// the scanner until it is turned back on; it starts on. The key differs
+/// from the diagnostic sensors' keys.
+pub const SCANNING_SWITCH: ListEntitiesSwitchResponse<'static> = ListEntitiesSwitchResponse {
+    object_id: "ble_scanning",
+    key: 4,
+    name: "BLE Scanning",
+    icon: "mdi:bluetooth-searching",
+    entity_category: entity_category::CONFIG,
+};
+
+/// What clients want from the scanner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wanted {
+    /// Mode to scan in.
+    pub mode: ScanMode,
+    /// Whether to scan at all.
+    pub enabled: bool,
+}
+
+impl Wanted {
+    /// Returns the [`SCANNING_SWITCH`] state for this request.
+    #[must_use]
+    pub const fn switch_state(&self) -> SwitchStateResponse {
+        SwitchStateResponse {
+            key: SCANNING_SWITCH.key,
+            state: self.enabled,
+        }
+    }
+}
+
 /// Creates a connected handle and driver for a scanner configured with
-/// `configured`.
+/// `configured`, which starts out scanning.
 #[must_use]
 pub fn channel(configured: ScanMode) -> (ScannerHandle, ScannerDriver) {
-    let (requested_tx, requested_rx) = watch::channel(configured);
+    let (wanted_tx, wanted_rx) = watch::channel(Wanted {
+        mode: configured,
+        enabled: true,
+    });
     let (status_tx, status_rx) = watch::channel(ScannerStatus {
         state: ScannerState::Idle,
         mode: configured,
     });
     let handle = ScannerHandle {
         configured,
-        requested: Arc::new(requested_tx),
+        wanted: Arc::new(wanted_tx),
         status: status_rx,
     };
     let driver = ScannerDriver {
-        requested: requested_rx,
+        wanted: wanted_rx,
         status: status_tx,
     };
     (handle, driver)
@@ -34,7 +70,7 @@ pub fn channel(configured: ScanMode) -> (ScannerHandle, ScannerDriver) {
 #[derive(Debug, Clone)]
 pub struct ScannerHandle {
     configured: ScanMode,
-    requested: Arc<watch::Sender<ScanMode>>,
+    wanted: Arc<watch::Sender<Wanted>>,
     status: watch::Receiver<ScannerStatus>,
 }
 
@@ -48,11 +84,19 @@ impl ScannerHandle {
     /// Asks the scanner to switch to `mode`. Repeating the current request
     /// does nothing.
     pub fn request(&self, mode: ScanMode) {
-        self.requested.send_if_modified(|requested| {
-            let changed = *requested != mode;
-            *requested = mode;
-            changed
-        });
+        self.update(|wanted| wanted.mode = mode);
+    }
+
+    /// Turns scanning on or off.
+    pub fn enable(&self, enabled: bool) {
+        self.update(|wanted| wanted.enabled = enabled);
+    }
+
+    /// Returns a receiver that follows what clients want, such as whether
+    /// scanning is on.
+    #[must_use]
+    pub fn wanted(&self) -> watch::Receiver<Wanted> {
+        self.wanted.subscribe()
     }
 
     /// Returns a receiver that follows the scanner's status.
@@ -60,31 +104,39 @@ impl ScannerHandle {
     pub fn status(&self) -> watch::Receiver<ScannerStatus> {
         self.status.clone()
     }
+
+    fn update(&self, change: impl FnOnce(&mut Wanted)) {
+        self.wanted.send_if_modified(|wanted| {
+            let before = *wanted;
+            change(wanted);
+            *wanted != before
+        });
+    }
 }
 
-/// Used by the scanner task to receive mode requests and report status.
+/// Used by the scanner task to receive requests and report status.
 #[derive(Debug)]
 pub struct ScannerDriver {
-    requested: watch::Receiver<ScanMode>,
+    wanted: watch::Receiver<Wanted>,
     status: watch::Sender<ScannerStatus>,
 }
 
 impl ScannerDriver {
-    /// Returns the requested mode, marking it as seen.
-    pub fn requested_mode(&mut self) -> ScanMode {
-        *self.requested.borrow_and_update()
+    /// Returns what clients want, marking it as seen.
+    pub fn wanted(&mut self) -> Wanted {
+        *self.wanted.borrow_and_update()
     }
 
-    /// Waits until a mode other than `current` is requested, and returns
-    /// it. Never completes if requests can no longer arrive.
-    pub async fn mode_change(&mut self, current: ScanMode) -> ScanMode {
+    /// Waits until clients want something other than `current`, and
+    /// returns it. Never completes if requests can no longer arrive.
+    pub async fn change(&mut self, current: Wanted) -> Wanted {
         loop {
-            if self.requested.changed().await.is_err() {
+            if self.wanted.changed().await.is_err() {
                 return std::future::pending().await;
             }
-            let mode = *self.requested.borrow_and_update();
-            if mode != current {
-                return mode;
+            let wanted = *self.wanted.borrow_and_update();
+            if wanted != current {
+                return wanted;
             }
         }
     }
@@ -105,12 +157,26 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::diagnostics;
+
+    async fn change(driver: &mut ScannerDriver, current: Wanted) -> Wanted {
+        tokio::time::timeout(Duration::from_secs(1), driver.change(current))
+            .await
+            .unwrap()
+    }
 
     #[tokio::test]
     async fn requests_reach_the_driver_and_status_reaches_handles() {
         let (handle, mut driver) = channel(ScanMode::Active);
         assert_eq!(handle.configured(), ScanMode::Active);
-        assert_eq!(driver.requested_mode(), ScanMode::Active);
+        let initial = driver.wanted();
+        assert_eq!(
+            initial,
+            Wanted {
+                mode: ScanMode::Active,
+                enabled: true
+            }
+        );
 
         let mut status = handle.status();
         assert_eq!(status.borrow_and_update().state, ScannerState::Idle);
@@ -118,11 +184,9 @@ mod tests {
         // Repeating the current mode is not a change.
         handle.request(ScanMode::Active);
         handle.request(ScanMode::Passive);
-        let changed =
-            tokio::time::timeout(Duration::from_secs(1), driver.mode_change(ScanMode::Active))
-                .await
-                .unwrap();
-        assert_eq!(changed, ScanMode::Passive);
+        let passive = change(&mut driver, initial).await;
+        assert_eq!(passive.mode, ScanMode::Passive);
+        assert!(passive.enabled);
 
         driver.report(ScannerState::Running, ScanMode::Passive);
         status.changed().await.unwrap();
@@ -136,5 +200,41 @@ mod tests {
         // Reporting the same status again does not notify.
         driver.report(ScannerState::Running, ScanMode::Passive);
         assert!(!status.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_switch_turns_scanning_off_and_on() {
+        let (handle, mut driver) = channel(ScanMode::Passive);
+        let mut followed = handle.wanted();
+        let on = driver.wanted();
+        assert!(followed.borrow_and_update().switch_state().state);
+
+        handle.enable(false);
+        let off = change(&mut driver, on).await;
+        assert_eq!(
+            off,
+            Wanted {
+                mode: ScanMode::Passive,
+                enabled: false
+            }
+        );
+        followed.changed().await.unwrap();
+        let state = followed.borrow_and_update().switch_state();
+        assert_eq!((state.key, state.state), (SCANNING_SWITCH.key, false));
+
+        // Turning it off again changes nothing.
+        handle.enable(false);
+        assert!(!followed.has_changed().unwrap());
+        handle.enable(true);
+        assert_eq!(change(&mut driver, off).await, on);
+    }
+
+    #[test]
+    fn switch_key_is_unique() {
+        let mut sensors = diagnostics::TEXT_SENSORS
+            .map(|sensor| sensor.key)
+            .into_iter()
+            .chain(diagnostics::SENSORS.map(|sensor| sensor.key));
+        assert!(sensors.all(|key| key != SCANNING_SWITCH.key));
     }
 }

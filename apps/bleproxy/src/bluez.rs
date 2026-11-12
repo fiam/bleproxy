@@ -38,7 +38,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::filter::AddressFilter;
-use crate::scanner::ScannerDriver;
+use crate::scanner::{ScannerDriver, Wanted};
 use zbus::message::Type as MessageType;
 use zbus::{Connection, MatchRule, MessageStream, OwnedObjectPath, OwnedVariant, Variant};
 
@@ -110,9 +110,10 @@ pub async fn adapter_address(adapter: &str) -> Result<BdAddr, BluezError> {
 /// `filter` allows to `sender`.
 ///
 /// Scans in the mode requested through `driver`, switching when another
-/// mode is requested, and reports the scanner's state back through it.
-/// Failures (BlueZ restarting, the adapter disappearing) are logged and the
-/// scan is restarted after a short delay.
+/// mode is requested and pausing while scanning is switched off, and
+/// reports the scanner's state back through it. Failures (BlueZ
+/// restarting, the adapter disappearing) are logged and the scan is
+/// restarted after a short delay.
 pub async fn scan_forever(
     adapter: String,
     mut driver: ScannerDriver,
@@ -120,11 +121,19 @@ pub async fn scan_forever(
     filter: AddressFilter,
 ) {
     loop {
-        let mode = driver.requested_mode();
+        let wanted = driver.wanted();
+        let mode = wanted.mode;
+        if !wanted.enabled {
+            info!("scanning is switched off");
+            driver.report(ScannerState::Stopped, mode);
+            driver.change(wanted).await;
+            continue;
+        }
         driver.report(ScannerState::Starting, mode);
-        match scan(&adapter, mode, &sender, &filter, &mut driver).await {
+        match scan(&adapter, wanted, &sender, &filter, &mut driver).await {
+            Ok(next) if !next.enabled => continue,
             Ok(next) => {
-                info!(from = ?mode, to = ?next, "switching scan mode");
+                info!(from = ?mode, to = ?next.mode, "switching scan mode");
                 continue;
             }
             Err(err) => {
@@ -133,23 +142,24 @@ pub async fn scan_forever(
             }
         }
         info!(delay = ?RETRY_DELAY, "restarting the scan");
-        // Retry after a delay, or right away in another mode if asked to.
+        // Retry after a delay, or right away if asked for something else.
         tokio::select! {
             () = tokio::time::sleep(RETRY_DELAY) => {}
-            _ = driver.mode_change(mode) => {}
+            _ = driver.change(wanted) => {}
         }
     }
 }
 
-/// Runs one scan session in `mode` until another mode is requested, which
-/// it returns, or until the connection to BlueZ fails.
+/// Runs one scan session as `wanted` until clients want something else,
+/// which it returns, or until the connection to BlueZ fails.
 async fn scan(
     adapter: &str,
-    mode: ScanMode,
+    wanted: Wanted,
     sender: &broadcast::Sender<Advertisement>,
     filter: &AddressFilter,
     driver: &mut ScannerDriver,
-) -> Result<ScanMode, BluezError> {
+) -> Result<Wanted, BluezError> {
+    let mode = wanted.mode;
     let connection = Connection::system().await?;
     let path = adapter_path(adapter);
 
@@ -186,7 +196,7 @@ async fn scan(
             Some(message) = changed.next() => (message?, Signal::Changed),
             Some(message) = added.next() => (message?, Signal::Added),
             Some(message) = removed.next() => (message?, Signal::Removed),
-            next = driver.mode_change(mode) => {
+            next = driver.change(wanted) => {
                 driver.report(ScannerState::Stopping, scanning);
                 stop(&connection, &path, scanning).await;
                 driver.report(ScannerState::Stopped, scanning);
