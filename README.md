@@ -145,7 +145,7 @@ Every option is a command-line flag and a `BLEPROXY_*` environment variable:
 | `--adapter` | `BLEPROXY_ADAPTER` | `hci0` | Bluetooth adapter to scan with |
 | `--scan-mode` | `BLEPROXY_SCAN_MODE` | `active` | Scan mode to start in: `active` or `passive` (see below) |
 | `--connection-slots` | `BLEPROXY_CONNECTION_SLOTS` | `3` | Devices Home Assistant may connect to at once; `0` turns connections off |
-| `--allow-address` | `BLEPROXY_ALLOW_ADDRESS` | every device | Only forward and connect to this device; repeat the flag or separate addresses with commas for several |
+| `--allow-address` | `BLEPROXY_ALLOW_ADDRESS` | every device | Only forward and connect to this device, given as `ADDRESS` or `ADDRESS=NAME`; repeat the flag or separate devices with commas for several |
 | `--encryption-key` | `BLEPROXY_ENCRYPTION_KEY` | none | Base64 key that encrypts the API (see below) |
 | `--encryption-key-file` | `BLEPROXY_ENCRYPTION_KEY_FILE` | none | File holding that key, to keep it out of the environment |
 | `--mac` | `BLEPROXY_MAC` | the adapter's address | Address identifying the proxy in Home Assistant |
@@ -178,6 +178,15 @@ bathroom, can be limited to it with `--allow-address 5C:CA:D3:BA:BA:CC`.
 Home Assistant then only receives that device's advertisements, and
 connecting to any other device fails. Without the flag every device is
 forwarded.
+
+Each allowed device also gets two diagnostic sensors on the proxy's device
+page: its signal strength and when it was last heard, which tell whether it
+is in range. They are named after the label in
+`--allow-address 5C:CA:D3:BA:BA:CC=Scale` ("Scale RSSI", "Scale Last Seen"),
+or else the name BlueZ knows for the device when bleproxy starts, or else the
+address. Home Assistant identifies the sensors by name, so a label keeps
+them stable: without one, a device BlueZ only learns the name of later gets
+new sensors after the next restart.
 
 **Encryption.** With a key, the API is encrypted exactly like an ESPHome
 device with `api: encryption: key:` (Noise, with a pre-shared key). Home
@@ -363,7 +372,8 @@ in both scan modes:
 - A third run does the same over an encrypted connection with an address
   filter. It checks that clients with a wrong key, or none, are rejected with
   the errors Home Assistant expects, and that filtered out devices are not
-  forwarded.
+  forwarded, and that allowed devices get signal sensors named by label,
+  by BlueZ's name or by address.
 - A last run takes away BlueZ's advertisement monitors and checks that
   passive scanning falls back to active.
 
@@ -446,6 +456,7 @@ Releases are fully automated with [release-please]:
 - [x] Diagnostic sensors: uptime, forwarded advertisements, connected clients
 - [x] BLE Scanning switch
 - [x] Logs streamed to Home Assistant
+- [x] Signal strength and last seen sensors for allowed devices
 - [ ] Windows and macOS backends
 - [ ] BLE scanning on ESP32 via esp-radio and TrouBLE
 

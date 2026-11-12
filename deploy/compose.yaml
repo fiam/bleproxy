@@ -20,7 +20,8 @@ services:
       # Devices Home Assistant may connect to at once (0 turns it off).
       # BLEPROXY_CONNECTION_SLOTS: "3"
       # Only forward these devices (comma-separated); all of them if unset.
-      # BLEPROXY_ALLOW_ADDRESS: 5C:CA:D3:BA:BA:CC
+      # `=NAME` names a device's signal and last seen sensors.
+      # BLEPROXY_ALLOW_ADDRESS: 5C:CA:D3:BA:BA:CC=Scale
       # Encrypt the API; Home Assistant asks for this key when adding the
       # proxy. Generate one with `openssl rand -base64 32`. To keep it out
       # of the environment, use BLEPROXY_ENCRYPTION_KEY_FILE with a file
