@@ -122,7 +122,9 @@ some sensors) connect to them through the proxy too.
 
 The proxy's device page has three diagnostic sensors about the proxy itself,
 refreshed every minute: its uptime, how many advertisements it has forwarded
-since starting, and how many clients (hosts) are connected to it.
+since starting, and how many clients (hosts) are connected to it. A **BLE
+Scanning** switch pauses scanning until it is turned back on; it starts on
+whenever bleproxy starts.
 
 ### Configuration
 
@@ -344,8 +346,8 @@ in both scan modes:
 - bleproxy runs against it as an unprivileged user.
 - aioesphomeapi, the client library Home Assistant uses, checks the device
   info and diagnostic sensors, that new and updated devices arrive as the
-  expected raw advertisements, the reported scanner state and switching
-  modes at runtime.
+  expected raw advertisements, the reported scanner state, switching modes
+  at runtime, and pausing scanning with the BLE Scanning switch.
 - The mock exports a GATT database like bluetoothd, and the client connects
   through bleproxy, lists services, reads, writes, subscribes to
   notifications and disconnects, checking BlueZ's quirks along the way.
@@ -433,6 +435,7 @@ Releases are fully automated with [release-please]:
 - [x] Noise encryption (ESPHome API encryption keys)
 - [x] Active connections (GATT proxying) on Linux
 - [x] Diagnostic sensors: uptime, forwarded advertisements, connected clients
+- [x] BLE Scanning switch
 - [ ] Windows and macOS backends
 - [ ] BLE scanning on ESP32 via esp-radio and TrouBLE
 
