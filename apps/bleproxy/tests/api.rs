@@ -13,6 +13,7 @@ use std::time::Duration;
 use bleproxy::connections::{
     self, Characteristic, Command, ConnectionsDriver, ConnectionsHandle, Descriptor, Event, Service,
 };
+use bleproxy::filter::AddressFilter;
 use bleproxy::scanner::{self, ScannerDriver, ScannerHandle};
 use bleproxy::{Identity, server};
 use bleproxy_core::Uuid;
@@ -51,7 +52,7 @@ impl Proxy {
     /// Starts a proxy that offers connections, returning the driver the
     /// test plays the connection manager with.
     async fn start_with_connections(limit: u32) -> (Self, ConnectionsDriver) {
-        let (handle, driver) = connections::channel(limit);
+        let (handle, driver) = connections::channel(limit, AddressFilter::default());
         (Self::start_with(None, Some(handle)).await, driver)
     }
 

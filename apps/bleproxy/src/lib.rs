@@ -8,6 +8,7 @@
 pub mod bluez;
 pub mod connections;
 pub mod encryption;
+pub mod filter;
 pub mod identity;
 pub mod mdns;
 pub mod scanner;

@@ -36,6 +36,7 @@ use futures_util::StreamExt;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+use crate::filter::AddressFilter;
 use crate::scanner::ScannerDriver;
 use zbus::message::Type as MessageType;
 use zbus::{Connection, MatchRule, MessageStream, OwnedObjectPath, OwnedVariant, Variant};
@@ -104,7 +105,8 @@ pub async fn adapter_address(adapter: &str) -> Result<BdAddr, BluezError> {
     })
 }
 
-/// Scans with `adapter` forever, publishing advertisements to `sender`.
+/// Scans with `adapter` forever, publishing advertisements from devices
+/// `filter` allows to `sender`.
 ///
 /// Scans in the mode requested through `driver`, switching when another
 /// mode is requested, and reports the scanner's state back through it.
@@ -114,11 +116,12 @@ pub async fn scan_forever(
     adapter: String,
     mut driver: ScannerDriver,
     sender: broadcast::Sender<Advertisement>,
+    filter: AddressFilter,
 ) {
     loop {
         let mode = driver.requested_mode();
         driver.report(ScannerState::Starting, mode);
-        match scan(&adapter, mode, &sender, &mut driver).await {
+        match scan(&adapter, mode, &sender, &filter, &mut driver).await {
             Ok(next) => {
                 info!(from = ?mode, to = ?next, "switching scan mode");
                 continue;
@@ -143,6 +146,7 @@ async fn scan(
     adapter: &str,
     mode: ScanMode,
     sender: &broadcast::Sender<Advertisement>,
+    filter: &AddressFilter,
     driver: &mut ScannerDriver,
 ) -> Result<ScanMode, BluezError> {
     let connection = Connection::system().await?;
@@ -229,7 +233,9 @@ async fn scan(
                 None
             }
         };
-        if let Some(advertisement) = advertisement {
+        if let Some(advertisement) = advertisement
+            && filter.allows(advertisement.address)
+        {
             // No receivers just means no client is subscribed right now.
             let _ = sender.send(advertisement);
         }

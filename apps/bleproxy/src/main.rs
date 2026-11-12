@@ -58,6 +58,18 @@ struct Cli {
     #[arg(long, env = "BLEPROXY_CONNECTION_SLOTS", default_value_t = 3)]
     connection_slots: u32,
 
+    /// Only forward advertisements from, and connect to, the device with
+    /// this address. Repeat it (or separate addresses with commas) to
+    /// allow several devices. [default: every device]
+    #[cfg(target_os = "linux")]
+    #[arg(
+        long = "allow-address",
+        env = "BLEPROXY_ALLOW_ADDRESS",
+        value_name = "ADDRESS",
+        value_delimiter = ','
+    )]
+    allow_addresses: Vec<BdAddr>,
+
     /// Key that encrypts the API, as 32 bytes of base64 (ESPHome's
     /// `api: encryption: key:`). Generate one with
     /// `openssl rand -base64 32`; Home Assistant asks for it when adding the
@@ -150,14 +162,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             .await
             .map_err(|err| format!("cannot use Bluetooth adapter {}: {err}", cli.adapter))?;
         info!(adapter = cli.adapter, %address, "using Bluetooth adapter");
+        let filter = bleproxy::filter::AddressFilter::new(cli.allow_addresses);
+        if filter.is_restricted() {
+            info!(devices = %filter, "only forwarding allowed devices");
+        }
         let (handle, driver) = bleproxy::scanner::channel(cli.scan_mode.into());
         tokio::spawn(bleproxy::bluez::scan_forever(
             cli.adapter.clone(),
             driver,
             advertisements.clone(),
+            filter.clone(),
         ));
         let connections = (cli.connection_slots > 0).then(|| {
-            let (handle, driver) = bleproxy::connections::channel(cli.connection_slots);
+            let (handle, driver) = bleproxy::connections::channel(cli.connection_slots, filter);
             tokio::spawn(bleproxy::bluez::manage_connections(
                 cli.adapter.clone(),
                 driver,
@@ -261,5 +278,34 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accepts_repeated_and_comma_separated_addresses() {
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from([
+            "bleproxy",
+            "--allow-address",
+            "5C:CA:D3:BA:BA:CC,A4:C1:38:00:11:22",
+            "--allow-address",
+            "A4:C1:38:00:33:44",
+        ])
+        .unwrap();
+        let addresses: Vec<String> = cli
+            .allow_addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            addresses,
+            [
+                "5C:CA:D3:BA:BA:CC",
+                "A4:C1:38:00:11:22",
+                "A4:C1:38:00:33:44"
+            ]
+        );
+        assert!(Cli::try_parse_from(["bleproxy", "--allow-address", "scale"]).is_err());
     }
 }

@@ -7,15 +7,19 @@
 //! [`ConnectionsDriver`], answers with [`Event`]s, and reports which
 //! devices hold the connection slots. A device connection belongs to the
 //! client that asked for it: its events go to that client, and it is
-//! closed when that client goes away.
+//! closed when that client goes away. Connecting to devices outside the
+//! [`AddressFilter`] fails without reaching the connection manager.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bleproxy_core::connection::ConnectionRequest;
 use bleproxy_core::{BdAddr, Uuid};
+use bleproxy_protocol::bluetooth_error;
 use tokio::sync::{mpsc, watch};
-use tracing::warn;
+use tracing::{info, warn};
+
+use crate::filter::AddressFilter;
 
 /// A connection request with its written value copied out of the message.
 pub type Request = ConnectionRequest<Vec<u8>>;
@@ -24,9 +28,10 @@ pub type Request = ConnectionRequest<Vec<u8>>;
 const EVENT_BACKLOG: usize = 256;
 
 /// Creates a connected handle and driver for a connection manager with
-/// `limit` connection slots.
+/// `limit` connection slots, which may only connect to devices `filter`
+/// allows.
 #[must_use]
-pub fn channel(limit: u32) -> (ConnectionsHandle, ConnectionsDriver) {
+pub fn channel(limit: u32, filter: AddressFilter) -> (ConnectionsHandle, ConnectionsDriver) {
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     let (slots_tx, slots_rx) = watch::channel(Slots {
         limit,
@@ -36,6 +41,7 @@ pub fn channel(limit: u32) -> (ConnectionsHandle, ConnectionsDriver) {
         commands: commands_tx,
         slots: slots_rx,
         next_client: Arc::new(AtomicU64::new(0)),
+        filter,
     };
     let driver = ConnectionsDriver {
         commands: commands_rx,
@@ -50,6 +56,7 @@ pub struct ConnectionsHandle {
     commands: mpsc::UnboundedSender<Command>,
     slots: watch::Receiver<Slots>,
     next_client: Arc<AtomicU64>,
+    filter: AddressFilter,
 }
 
 impl ConnectionsHandle {
@@ -62,6 +69,7 @@ impl ConnectionsHandle {
             commands: self.commands.clone(),
             events_tx: EventSender(events_tx),
             events,
+            filter: self.filter.clone(),
         }
     }
 
@@ -102,12 +110,29 @@ pub struct Client {
     commands: mpsc::UnboundedSender<Command>,
     events_tx: EventSender,
     events: mpsc::Receiver<Event>,
+    filter: AddressFilter,
 }
 
 impl Client {
     /// Passes `request` on to the connection manager. Requests are dropped
     /// if it has stopped.
+    ///
+    /// Connecting to a device the filter leaves out fails right away.
+    /// Other requests go through, since the manager already answers those
+    /// for devices that aren't connected.
     pub fn request(&self, request: Request) {
+        if let Request::Connect { address, .. } = request
+            && !self.filter.allows(address)
+        {
+            info!(%address, "refused to connect to a filtered out device");
+            self.events_tx.send(Event::Connection {
+                address,
+                connected: false,
+                mtu: 0,
+                error: bluetooth_error::CONNECTION_FAILED,
+            });
+            return;
+        }
         let _ = self.commands.send(Command::Request {
             client: self.id,
             events: self.events_tx.clone(),
@@ -298,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn routes_requests_and_events_per_client() {
-        let (handle, mut driver) = channel(3);
+        let (handle, mut driver) = channel(3, AddressFilter::default());
         assert_eq!(driver.limit(), 3);
         let mut client = handle.client();
         let other = handle.client();
@@ -331,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn publishes_slot_changes() {
-        let (handle, driver) = channel(2);
+        let (handle, driver) = channel(2, AddressFilter::default());
         let mut slots = handle.slots();
         assert_eq!(slots.borrow_and_update().free(), 2);
 
@@ -346,6 +371,40 @@ mod tests {
         assert!(!slots.has_changed().unwrap());
     }
 
+    #[tokio::test]
+    async fn refuses_to_connect_to_filtered_out_devices() {
+        const ALLOWED: BdAddr = BdAddr::new([0x5C, 0xCA, 0xD3, 0xBA, 0xBA, 0xCC]);
+        let (handle, mut driver) = channel(1, AddressFilter::new(vec![ALLOWED]));
+        let mut client = handle.client();
+
+        client.request(ConnectionRequest::Connect {
+            address: DEVICE,
+            address_type: None,
+        });
+        assert_eq!(
+            client.event().await,
+            Event::Connection {
+                address: DEVICE,
+                connected: false,
+                mtu: 0,
+                error: bluetooth_error::CONNECTION_FAILED,
+            }
+        );
+
+        // Allowed devices, and other requests, reach the manager.
+        client.request(ConnectionRequest::Connect {
+            address: ALLOWED,
+            address_type: None,
+        });
+        client.request(ConnectionRequest::Disconnect { address: DEVICE });
+        for expected in [ALLOWED, DEVICE] {
+            let Some(Command::Request { request, .. }) = driver.next().await else {
+                panic!("expected a request");
+            };
+            assert_eq!(request.address(), expected);
+        }
+    }
+
     #[test]
     fn never_reports_negative_free_slots() {
         let slots = Slots {
@@ -357,7 +416,7 @@ mod tests {
 
     #[tokio::test]
     async fn drops_events_for_clients_that_fall_behind() {
-        let (handle, _driver) = channel(1);
+        let (handle, _driver) = channel(1, AddressFilter::default());
         let mut client = handle.client();
         let read = |data: u8| Event::Read {
             address: DEVICE,
