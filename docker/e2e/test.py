@@ -8,6 +8,7 @@ through bleproxy. Run through `cargo xtask e2e`.
 
 import asyncio
 import base64
+import datetime
 import os
 import signal
 import subprocess
@@ -39,6 +40,7 @@ ADAPTER_ADDRESS = "00:01:02:03:04:05"  # what the mock assigns to hci0
 DEVICE_ADDRESS = "A4:C1:38:00:11:22"
 SECOND_ADDRESS = "A4:C1:38:00:33:44"
 BLOCKED_ADDRESS = "A4:C1:38:00:55:66"  # left out by the address filter
+KNOWN_ADDRESS = "A4:C1:38:00:77:88"  # known to BlueZ before bleproxy starts
 TIMEOUT = 10
 MODES = {"active": BluetoothScannerMode.ACTIVE, "passive": BluetoothScannerMode.PASSIVE}
 NOBODY = 65534
@@ -320,7 +322,16 @@ async def check_scanning_started(bus, mode, pid):
         assert (0, 0x01, b"\x06") in patterns, patterns
 
 
-async def check_entities(client):
+def device_sensor_ids(addresses):
+    """The object IDs of the allowed devices' signal and last seen sensors."""
+    ids = set()
+    for address in addresses:
+        suffix = address.replace(":", "").lower()
+        ids |= {f"rssi_{suffix}", f"last_seen_{suffix}"}
+    return ids
+
+
+async def check_entities(client, allowed=()):
     """The proxy's own entities, listed and reported like ESPHome's.
 
     Returns the scanning switch and the list states keep arriving in.
@@ -330,7 +341,8 @@ async def check_entities(client):
     assert not services, services
     by_id = {entity.object_id: entity for entity in entities}
     sensors = {"uptime", "advertisements", "connected_clients"}
-    assert set(by_id) == sensors | {"ble_scanning"}, by_id
+    devices = device_sensor_ids(allowed)
+    assert set(by_id) == sensors | devices | {"ble_scanning"}, by_id
     assert isinstance(by_id["uptime"], TextSensorInfo), by_id
     assert isinstance(by_id["advertisements"], SensorInfo), by_id
     assert by_id["advertisements"].state_class == SensorStateClass.TOTAL_INCREASING, by_id
@@ -388,6 +400,45 @@ async def check_scanning_switch(client, bus, mode, switch, states, scanner_state
     await wait_for_new(
         states, seen_states, lambda s: s.key == switch.key and s.state, "switch on"
     )
+
+
+async def check_device_sensors(key):
+    """Allowed devices are named by label, by BlueZ's name, or by address,
+    and report their signal and when they were last heard."""
+    step("checking the allowed devices' sensors")
+    client = await connect(key)
+    entities, _ = await client.list_entities_services()
+    by_name = {entity.name: entity for entity in entities}
+    names = {
+        "Thermo": DEVICE_ADDRESS,
+        SECOND_ADDRESS: SECOND_ADDRESS,
+        "ATC_7788": KNOWN_ADDRESS,
+    }
+    for name, address in names.items():
+        rssi, last_seen = by_name[f"{name} RSSI"], by_name[f"{name} Last Seen"]
+        suffix = address.replace(":", "").lower()
+        assert rssi.object_id == f"rssi_{suffix}", rssi
+        assert isinstance(rssi, SensorInfo) and rssi.device_class == "signal_strength", rssi
+        assert rssi.unit_of_measurement == "dBm", rssi
+        assert rssi.entity_category == EntityCategory.DIAGNOSTIC, rssi
+        assert isinstance(last_seen, TextSensorInfo), last_seen
+        assert last_seen.device_class == "timestamp", last_seen
+
+    states = []
+    client.subscribe_states(states.append)
+    async with asyncio.timeout(TIMEOUT):
+        while len(states) < len(entities):
+            await asyncio.sleep(0.05)
+    by_key = {state.key: state for state in states}
+    # The device's last advertisement had an RSSI of -60.
+    thermo = by_key[by_name["Thermo RSSI"].key]
+    assert not thermo.missing_state and thermo.state == -60, thermo
+    seen = by_key[by_name["Thermo Last Seen"].key]
+    assert not seen.missing_state, seen
+    heard = datetime.datetime.fromisoformat(seen.state)
+    now = datetime.datetime.now(datetime.UTC)
+    assert datetime.timedelta(0) <= now - heard < datetime.timedelta(minutes=1), seen
+    await client.disconnect()
 
 
 async def check_logs(key):
@@ -504,7 +555,12 @@ async def main(binary, mode, encrypted, filtered):
     if key:
         env["BLEPROXY_ENCRYPTION_KEY"] = key
     if filtered:
-        env["BLEPROXY_ALLOW_ADDRESS"] = f"{DEVICE_ADDRESS},{SECOND_ADDRESS}"
+        # BlueZ already knows one device's name; one gets a label, one
+        # neither.
+        mock.AddDevice("hci0", KNOWN_ADDRESS, "ATC_7788")
+        env["BLEPROXY_ALLOW_ADDRESS"] = (
+            f"{DEVICE_ADDRESS}=Thermo,{SECOND_ADDRESS},{KNOWN_ADDRESS}"
+        )
     proxy = start_proxy(binary, mode, env)
     try:
         if encrypted:
@@ -522,7 +578,8 @@ async def main(binary, mode, encrypted, filtered):
         # Passive scan, active connections, remote caching, raw
         # advertisements, and state and mode.
         assert flags == 0b110_0111, flags
-        switch, entity_states = await check_entities(client)
+        allowed = (DEVICE_ADDRESS, SECOND_ADDRESS, KNOWN_ADDRESS) if filtered else ()
+        switch, entity_states = await check_entities(client, allowed)
         await check_logs(key)
 
         states = []
@@ -615,6 +672,7 @@ async def main(binary, mode, encrypted, filtered):
         if filtered:
             blocked = int(BLOCKED_ADDRESS.replace(":", ""), 16)
             assert all(a.address != blocked for a in received), "forwarded a filtered out device"
+            await check_device_sensors(key)
 
         await check_connections(bus, client, path, flags)
     finally:
